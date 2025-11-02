@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import logging
+import asyncio
 import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
@@ -38,7 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def read_target_stocks(filename='Market Data.csv'):
+def read_target_stocks(filename='Market Data_top10.csv'):
     """
     Read stock codes from CSV file
 
@@ -72,26 +73,31 @@ def read_target_stocks(filename='Market Data.csv'):
     return stock_codes
 
 
-def process_single_stock(stock_code, max_posts, max_workers):
+def process_single_stock(stock_code, max_posts, max_concurrent=50):
     """
     Process a single stock code - for use in parallel processing
     (This function runs in a separate process)
+    Uses ASYNC crawler for high performance
     """
     start_time = time.time()
 
     try:
         crawler = NaverStockCrawlerPC()
-        discussions = crawler.crawl_stock_discussions(
-            stock_code,
-            max_posts=max_posts,
-            max_workers=max_workers
+
+        # Run async crawler in this process's event loop
+        discussions = asyncio.run(
+            crawler.crawl_stock_discussions_async(
+                stock_code,
+                max_posts=max_posts,
+                max_concurrent=max_concurrent
+            )
         )
+
         elapsed = time.time() - start_time
         return (stock_code, discussions, elapsed)
 
     except Exception as e:
         # 자식 프로세스에서 발생한 에러 로깅
-        # (별도 로거 설정이 없으면 메인 로거를 사용)
         logger_sp = logging.getLogger(__name__)
         logger_sp.error(f"Error in child process for stock {stock_code}: {e}")
         elapsed = time.time() - start_time
@@ -124,7 +130,7 @@ def main():
     logger.info(f"  - Stock Processes (parallel stocks): {stock_processes}")
 
     # Read target stocks
-    stock_codes = read_target_stocks('Market Data.csv')
+    stock_codes = read_target_stocks('Market Data_top10.csv')
 
     if not stock_codes:
         logger.error("No stock codes found in CSV file")
