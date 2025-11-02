@@ -33,6 +33,7 @@ LOG_FILE="${LOG_DIR}/${LOG_PREFIX}_${TIMESTAMP}.log"
 echo "Running Python script: $PYTHON_SCRIPT"
 echo "Log file will be saved to: $LOG_FILE"
 
-python3 $PYTHON_SCRIPT > $LOG_FILE 2>&1
+# 가상환경의 python 사용 (python3가 아닌 python 또는 직접 경로)
+python $PYTHON_SCRIPT > $LOG_FILE 2>&1
 
 echo "Script execution finished."

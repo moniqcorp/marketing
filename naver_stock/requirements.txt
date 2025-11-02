@@ -1,0 +1,13 @@
+# Web scraping
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+
+# Database
+psycopg2-binary==2.9.9
+
+# Data processing
+pandas==2.2.0
+
+# Environment management
+python-dotenv==1.0.1
