@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# Environment variables
+.env
+credentials/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+crawler.log
+
+# Database
+*.db
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Chrome Driver
+chromedriver
+chromedriver.exe
+
+# Crawling Results (JSON files from tests)
+*_results.json
+*_posts*.json
+async_crawl*.json
+final_*.json
+test_*.json
+
+# HTML Samples
+html_samples/
+*.html
+
+# WebDriver Manager Cache
+.wdm/
+
+# Tests folder
+tests/
+
+# ERD Schemas (documentation only)
+erd_schemas/
+schema.sql
+
+# Archived files
+archived_files/
+history/
+docs/
+
+# Data files
+Moniq Company Info.csv
+Moniq Company Info_test10.csv
+*.csv
+
+
