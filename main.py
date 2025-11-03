@@ -76,7 +76,7 @@ async def log_requests_middleware(request: Request, call_next):
 
 @app.get("/")
 def root():
-    return {"message": "Welcome to Delivery Scraper API"}
+    return {"message": "Welcome to Stock Market Data Collection API"}
 
 
 app.include_router(toss_router.router)
