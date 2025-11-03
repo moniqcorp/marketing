@@ -34,7 +34,12 @@ async def lifespan(app: FastAPI):
     logging.shutdown()
 
 
-app = FastAPI(title="Delivery Scraper", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Stock Market Data Collection API",
+    description="주식 시장 데이터 수집 서버",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 @app.middleware("http")
