@@ -17,9 +17,9 @@ class TossPostCommentBody(BaseModel):
     summary="post-comment",
     description="토스 증권의 댓글 데이터를 수집 하는 API",
 )
-async def get_order(body: TossPostCommentBody):
+async def get_comments(body: TossPostCommentBody):
     """
-    # 요기요(Yogiyo) > 주문 조회
+    # 토스 증권(toss) > 증권별 게시물 댓글 조회
     """
     result = await toss_cookies.main(body.model_dump())
     return result

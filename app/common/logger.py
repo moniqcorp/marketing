@@ -151,14 +151,14 @@ class ParallelTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler
         self.rolloverAt = newRolloverAt
 
 
-DeliveryService = Literal["baemin", "coupangeats", "yogiyo"]
+DeliveryService = Literal["toss"]
 
 
 def setup_loggers():
     # --- 1. Main 로거 설정 ---
-    main_log_dir = "log/dev"
+    main_log_dir = "log/system"
     os.makedirs(main_log_dir, exist_ok=True)
-    main_logger = logging.getLogger("dev")
+    main_logger = logging.getLogger("system")
     main_logger.setLevel(logging.INFO)
 
     if not main_logger.handlers:
@@ -167,7 +167,7 @@ def setup_loggers():
             defaults={"route": "system"},
         )
         handler = ParallelTimedRotatingFileHandler(
-            filename=f"{main_log_dir}/dev",
+            filename=f"{main_log_dir}/system",
             when="midnight",
             interval=1,
             backupCount=30,
@@ -178,7 +178,7 @@ def setup_loggers():
         main_logger.propagate = False
 
     # --- 2. 서비스별 로거 설정 ---
-    services: list[DeliveryService] = ["baemin", "coupangeats", "yogiyo"]
+    services: list[DeliveryService] = ["toss"]
     for service_name in services:
         log_dir = f"log/{service_name}"
         os.makedirs(log_dir, exist_ok=True)
