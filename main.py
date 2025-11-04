@@ -4,14 +4,15 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
-from dotenv import load_dotenv
+
+# from dotenv import load_dotenv
 
 from app.common.logger import main_logger
 from app.common.request_function import browser_manager
 
 from app.routers.toss import toss_router
 
-load_dotenv()
+# load_dotenv()
 os.makedirs("log", exist_ok=True)
 
 
@@ -20,13 +21,11 @@ async def lifespan(app: FastAPI):
     """
     애플리케이션 시작 시 브라우저를 실행하고, 종료 시 안전하게 닫습니다.
     """
-    # --- MODIFIED: 애플리케이션 시작 로직 ---
     main_logger.info("✅ 애플리케이션 시작...", extra={"route": "/startup"})
     await browser_manager.startup()  # 브라우저 실행 및 준비
 
-    yield  # 이 시점에서 애플리케이션이 실행되고 요청을 처리합니다.
+    yield
 
-    # --- MODIFIED: 애플리케이션 종료 로직 ---
     await browser_manager.shutdown()  # 브라우저 종료
     main_logger.info(
         "🛑 애플리케이션 종료. 로그를 flush합니다.", extra={"route": "/shutdown"}

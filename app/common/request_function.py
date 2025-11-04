@@ -168,19 +168,20 @@ class AsyncBrowserClient:
 
     async def get_cookies(
         self,
-        login_url: str,
-        id_selector: str,
-        pw_selector: str,
-        btn_selector: str,
-        user_id: str,
-        user_pw: str,
+        url: str,
+        id_selector: str | None = None,
+        pw_selector: str | None = None,
+        btn_selector: str | None = None,
+        user_id: str | None = None,
+        user_pw: str | None = None,
         wait_for_cookies: List[str] | str | None = None,
         wait_for_url: str | None = None,
         wait_timeout: int = 10000,
         btn_click_duration: float = 5,
     ) -> dict:
         """
-        지정된 사이트에 로그인하고 쿠키를 반환합니다.
+        지정된 URL에 접속하여 쿠키를 반환합니다.
+        로그인 정보가 없으면 로그인 단계를 건너뜁니다.
         """
         if not self._page or not self._context:
             error_msg = "클라이언트가 초기화되지 않았습니다."
@@ -189,33 +190,36 @@ class AsyncBrowserClient:
 
         try:
             # 페이지 이동
-            await self._page.goto(
-                login_url, timeout=30000, wait_until="domcontentloaded"
-            )
+            await self._page.goto(url, timeout=30000, wait_until="domcontentloaded")
 
-            # 입력 필드 대기
-            await self._page.wait_for_selector(
-                id_selector, timeout=wait_timeout, state="visible"
-            )
+            # 로그인 (모든 필드가 제공된 경우에만)
+            if id_selector and pw_selector and btn_selector and user_id and user_pw:
+                # 입력 필드 대기
+                await self._page.wait_for_selector(
+                    id_selector, timeout=wait_timeout, state="visible"
+                )
 
-            # 랜덤 대기
-            await self._page.wait_for_timeout(random.randint(200, 1000))
+                # 랜덤 대기
+                await self._page.wait_for_timeout(random.randint(200, 1000))
 
-            # ID 입력
-            await self._page.type(id_selector, user_id, delay=random.uniform(80, 150))
-            await self._page.wait_for_timeout(random.randint(150, 400))
+                # ID 입력
+                await self._page.type(
+                    id_selector, user_id, delay=random.uniform(80, 150)
+                )
+                await self._page.wait_for_timeout(random.randint(150, 400))
 
-            # 비밀번호 입력
-            await self._page.type(pw_selector, user_pw, delay=random.uniform(100, 200))
-            await self._page.wait_for_timeout(random.randint(250, 500))
+                # 비밀번호 입력
+                await self._page.type(
+                    pw_selector, user_pw, delay=random.uniform(100, 200)
+                )
+                await self._page.wait_for_timeout(random.randint(250, 500))
 
-            # 버튼 클릭
-            # await self._page.click(btn_selector)
-            await self.click_for_duration(
-                btn_selector,
-                duration_seconds=btn_click_duration,
-                delay_between_clicks=0.3,
-            )
+                # 버튼 클릭
+                await self.click_for_duration(
+                    btn_selector,
+                    duration_seconds=btn_click_duration,
+                    delay_between_clicks=0.3,
+                )
 
             # 쿠키 대기
             if wait_for_cookies:

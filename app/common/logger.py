@@ -201,4 +201,4 @@ def setup_loggers():
 setup_loggers()
 
 main_logger = logging.getLogger("system")
-baemin_logger = logging.getLogger("toss")
+toss_logger = logging.getLogger("toss")
