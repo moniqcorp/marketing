@@ -51,14 +51,14 @@ async def collect_metadata(stock_codes, start_date, end_date):
     batch_map = {}  # {(stock_code, date_key): [nid_list]}
     crawler = NaverStockCrawlerPC()
 
-    # Create aiohttp session
+    # Create aiohttp session with conservative limits to avoid connection resets
     connector = aiohttp.TCPConnector(
-        limit=150,
-        limit_per_host=100,
+        limit=30,  # Reduced from 150
+        limit_per_host=20,  # Reduced from 100
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
         force_close=False,
-        keepalive_timeout=60
+        keepalive_timeout=30  # Reduced from 60
     )
     timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=30)
 
@@ -106,7 +106,7 @@ async def collect_metadata(stock_codes, start_date, end_date):
     return batch_map
 
 
-async def crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=20):
+async def crawl_and_save(batch_map, gcs_writer, stock_name_map, stock_isin_map, max_concurrent=20):
     """
     Phase 2: Crawl details by date and save to GCS
 
@@ -114,6 +114,7 @@ async def crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=2
         batch_map: {(stock_code, date_key): [nid_list]}
         gcs_writer: GCSParquetWriter instance
         stock_name_map: {stock_code: stock_name} mapping
+        stock_isin_map: {stock_code: isin_code} mapping
         max_concurrent: Max concurrent requests
 
     Returns:
@@ -141,14 +142,14 @@ async def crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=2
 
     crawler = NaverStockCrawlerPC()
 
-    # Create aiohttp session
+    # Create aiohttp session with conservative limits to avoid connection resets
     connector = aiohttp.TCPConnector(
-        limit=150,
-        limit_per_host=100,
+        limit=30,  # Reduced from 150
+        limit_per_host=20,  # Reduced from 100
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
         force_close=False,
-        keepalive_timeout=60
+        keepalive_timeout=30  # Reduced from 60
     )
     timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=30)
 
@@ -185,10 +186,14 @@ async def crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=2
                 """Fetch single post with semaphore"""
                 async with semaphore:
                     try:
-                        # Get stock name from mapping
-                        stock_name = stock_name_map.get(stock_code)
+                        # Small delay to prevent overwhelming the server
+                        await asyncio.sleep(0.05)
+
+                        # Get stock name and ISIN from mappings
+                        stock_name = stock_name_map.get(stock_code, '')
+                        isin_code = stock_isin_map.get(stock_code, '')
                         post = await crawler.get_discussion_detail_async(
-                            session, stock_code, nid, stock_name=stock_name
+                            session, stock_code, nid, stock_name=stock_name, isin_code=isin_code
                         )
                         if post:
                             # Convert comment_data to JSON string
@@ -298,46 +303,52 @@ async def main():
 
     # Load target stocks
     stock_name_map = {}  # {stock_code: stock_name}
+    stock_isin_map = {}  # {stock_code: isin_code}
 
     if target_stock_codes:
         # Use command-line provided stock codes
         stock_codes = target_stock_codes
         logger.info(f"Using {len(stock_codes)} stock codes from command line")
 
-        # Try to load names from source if available
+        # Try to load names and ISIN codes from source if available
         stock_source = os.getenv('STOCK_SOURCE', 'csv')
         try:
             if stock_source == 'bigquery':
-                _, full_name_map = load_stocks(
+                _, full_name_map, full_isin_map = load_stocks(
                     source='bigquery',
                     dataset_id=os.getenv('BQ_DATASET_ID'),
                     table_id=os.getenv('BQ_STOCK_TABLE_ID'),
                     project_id=os.getenv('GCP_PROJECT_ID'),
                     credentials_path=credentials_path,
                     code_column=os.getenv('BQ_STOCK_CODE_COLUMN', 'stock_code'),
-                    name_column=os.getenv('BQ_STOCK_NAME_COLUMN', 'stock_name')
+                    name_column=os.getenv('BQ_STOCK_NAME_COLUMN', 'stock_name'),
+                    isin_column=os.getenv('BQ_STOCK_ISIN_COLUMN', 'isin_code')
                 )
-                # Filter name map to only target codes
+                # Filter maps to only target codes
                 stock_name_map = {code: full_name_map.get(code, '') for code in stock_codes}
+                stock_isin_map = {code: full_isin_map.get(code, '') for code in stock_codes}
             else:
                 csv_filename = os.getenv('STOCK_CSV_FILE', 'Market Data_top10.csv')
-                _, full_name_map = load_stocks(
+                _, full_name_map, full_isin_map = load_stocks(
                     source='csv',
                     filename=csv_filename,
                     code_column='isu_cd',
-                    name_column='isu_nm'
+                    name_column='isu_nm',
+                    isin_column=os.getenv('CSV_ISIN_COLUMN')  # Optional
                 )
                 stock_name_map = {code: full_name_map.get(code, '') for code in stock_codes}
+                stock_isin_map = {code: full_isin_map.get(code, '') for code in stock_codes}
         except Exception as e:
-            logger.warning(f"Could not load stock names: {e}")
+            logger.warning(f"Could not load stock names/ISIN: {e}")
             stock_name_map = {code: '' for code in stock_codes}
+            stock_isin_map = {code: '' for code in stock_codes}
     else:
         # Load from configured source
         stock_source = os.getenv('STOCK_SOURCE', 'csv')
 
         if stock_source == 'bigquery':
             logger.info("Loading stocks from BigQuery...")
-            stock_codes, stock_name_map = load_stocks(
+            stock_codes, stock_name_map, stock_isin_map = load_stocks(
                 source='bigquery',
                 dataset_id=os.getenv('BQ_DATASET_ID'),
                 table_id=os.getenv('BQ_STOCK_TABLE_ID'),
@@ -345,6 +356,7 @@ async def main():
                 credentials_path=credentials_path,
                 code_column=os.getenv('BQ_STOCK_CODE_COLUMN', 'stock_code'),
                 name_column=os.getenv('BQ_STOCK_NAME_COLUMN', 'stock_name'),
+                isin_column=os.getenv('BQ_STOCK_ISIN_COLUMN', 'isin_code'),
                 filters='target_stock = 1',  # Only load stocks with target_stock = 1
                 limit=int(os.getenv('BQ_LIMIT', 0)) or None  # 0 means no limit
             )
@@ -352,11 +364,12 @@ async def main():
             # Load from CSV (default)
             csv_filename = os.getenv('STOCK_CSV_FILE', 'Market Data_top10.csv')
             logger.info(f"Loading stocks from CSV: {csv_filename}")
-            stock_codes, stock_name_map = load_stocks(
+            stock_codes, stock_name_map, stock_isin_map = load_stocks(
                 source='csv',
                 filename=csv_filename,
                 code_column='isu_cd',
-                name_column='isu_nm'
+                name_column='isu_nm',
+                isin_column=os.getenv('CSV_ISIN_COLUMN')  # Optional
             )
 
     if not stock_codes:
@@ -387,8 +400,8 @@ async def main():
             logger.warning("No posts found in date range")
             sys.exit(0)
 
-        # Phase 2: Crawl and save
-        stats = await crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=20)
+        # Phase 2: Crawl and save (reduced concurrency to avoid connection resets)
+        stats = await crawl_and_save(batch_map, gcs_writer, stock_name_map, stock_isin_map, max_concurrent=10)
 
         # Summary
         total_elapsed = time.time() - start_time

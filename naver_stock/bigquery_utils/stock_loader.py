@@ -12,9 +12,10 @@ logger = logging.getLogger(__name__)
 
 def load_stocks_from_bigquery(dataset_id, table_id, project_id=None, credentials_path=None,
                                code_column='stock_code', name_column='stock_name',
+                               isin_column='isin_code',
                                filters=None, limit=None):
     """
-    Load stock codes and names from BigQuery
+    Load stock codes, names, and ISIN codes from BigQuery
 
     Args:
         dataset_id: BigQuery dataset ID
@@ -23,18 +24,19 @@ def load_stocks_from_bigquery(dataset_id, table_id, project_id=None, credentials
         credentials_path: Path to service account JSON (optional)
         code_column: Column name for stock code (default: 'stock_code')
         name_column: Column name for stock name (default: 'stock_name')
+        isin_column: Column name for ISIN code (default: 'isin_code')
         filters: Optional SQL WHERE clause (e.g., "market_type = 'KOSPI'")
         limit: Optional limit on number of stocks (for testing)
 
     Returns:
-        tuple: (list of stock codes, dict of {code: name})
+        tuple: (list of stock codes, dict of {code: name}, dict of {code: isin})
     """
     try:
         client = BigQueryClient(project_id, credentials_path)
 
         # Build query
         sql = f"""
-        SELECT DISTINCT {code_column} as stock_code, {name_column} as stock_name
+        SELECT DISTINCT {code_column} as stock_code, {name_column} as stock_name, {isin_column} as isin_code
         FROM `{client.project_id}.{dataset_id}.{table_id}`
         """
 
@@ -55,33 +57,37 @@ def load_stocks_from_bigquery(dataset_id, table_id, project_id=None, credentials
 
         stock_codes = []
         stock_name_map = {}
+        stock_isin_map = {}
 
         for row in results:
             code = row['stock_code']
             name = row.get('stock_name', '')
+            isin = row.get('isin_code', '')
             stock_codes.append(code)
             stock_name_map[code] = name
+            stock_isin_map[code] = isin
 
         logger.info(f"Loaded {len(stock_codes)} stocks from BigQuery")
 
-        return stock_codes, stock_name_map
+        return stock_codes, stock_name_map, stock_isin_map
 
     except Exception as e:
         logger.error(f"Failed to load stocks from BigQuery: {e}")
         raise
 
 
-def load_stocks_from_csv(filename='Market Data.csv', code_column='isu_cd', name_column='isu_nm'):
+def load_stocks_from_csv(filename='Market Data.csv', code_column='isu_cd', name_column='isu_nm', isin_column=None):
     """
-    Load stock codes and names from CSV file
+    Load stock codes, names, and ISIN codes from CSV file
 
     Args:
         filename: Path to CSV file
         code_column: Column name for stock code (default: 'isu_cd')
         name_column: Column name for stock name (default: 'isu_nm')
+        isin_column: Column name for ISIN code (optional)
 
     Returns:
-        tuple: (list of stock codes, dict of {code: name})
+        tuple: (list of stock codes, dict of {code: name}, dict of {code: isin})
     """
     try:
         df = pd.read_csv(filename)
@@ -95,8 +101,19 @@ def load_stocks_from_csv(filename='Market Data.csv', code_column='isu_cd', name_
             df[name_column]
         ))
 
+        # Create ISIN mapping (if column exists)
+        stock_isin_map = {}
+        if isin_column and isin_column in df.columns:
+            stock_isin_map = dict(zip(
+                df[code_column].astype(str).str.zfill(6),
+                df[isin_column].fillna('')
+            ))
+        else:
+            # Fill with empty strings if no ISIN column
+            stock_isin_map = {code: '' for code in stock_codes}
+
         logger.info(f"Loaded {len(stock_codes)} stocks from {filename}")
-        return stock_codes, stock_name_map
+        return stock_codes, stock_name_map, stock_isin_map
 
     except FileNotFoundError:
         logger.error(f"CSV file not found: {filename}")
@@ -111,7 +128,7 @@ def load_stocks_from_csv(filename='Market Data.csv', code_column='isu_cd', name_
 
 def load_stocks(source='csv', **kwargs):
     """
-    Load stock codes and names from specified source
+    Load stock codes, names, and ISIN codes from specified source
 
     Args:
         source: 'csv' or 'bigquery'
@@ -121,6 +138,7 @@ def load_stocks(source='csv', **kwargs):
         - filename: CSV file path (default: 'Market Data.csv')
         - code_column: Stock code column name (default: 'isu_cd')
         - name_column: Stock name column name (default: 'isu_nm')
+        - isin_column: ISIN code column name (optional)
 
     BigQuery kwargs:
         - dataset_id: BigQuery dataset ID (required)
@@ -129,17 +147,19 @@ def load_stocks(source='csv', **kwargs):
         - credentials_path: Service account JSON path (optional)
         - code_column: Stock code column name (default: 'stock_code')
         - name_column: Stock name column name (default: 'stock_name')
+        - isin_column: ISIN code column name (default: 'isin_code')
         - filters: SQL WHERE clause (optional)
         - limit: Limit number of stocks (optional, for testing)
 
     Returns:
-        tuple: (list of stock codes, dict of {code: name})
+        tuple: (list of stock codes, dict of {code: name}, dict of {code: isin})
     """
     if source == 'csv':
         return load_stocks_from_csv(
             filename=kwargs.get('filename', 'Market Data.csv'),
             code_column=kwargs.get('code_column', 'isu_cd'),
-            name_column=kwargs.get('name_column', 'isu_nm')
+            name_column=kwargs.get('name_column', 'isu_nm'),
+            isin_column=kwargs.get('isin_column')
         )
     elif source == 'bigquery':
         if 'dataset_id' not in kwargs or 'table_id' not in kwargs:
@@ -152,6 +172,7 @@ def load_stocks(source='csv', **kwargs):
             credentials_path=kwargs.get('credentials_path'),
             code_column=kwargs.get('code_column', 'stock_code'),
             name_column=kwargs.get('name_column', 'stock_name'),
+            isin_column=kwargs.get('isin_column', 'isin_code'),
             filters=kwargs.get('filters'),
             limit=kwargs.get('limit')
         )

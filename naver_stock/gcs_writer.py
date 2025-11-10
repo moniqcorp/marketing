@@ -88,6 +88,7 @@ class GCSParquetWriter:
             schema = pa.schema([
                 ('stock_code', pa.string()),
                 ('stock_name', pa.string()),
+                ('isin_code', pa.string()),  # ISIN code
                 ('comment_id', pa.int64()),
                 ('author_name', pa.string()),
                 ('date', pa.string()),  # Store as string for BigQuery compatibility

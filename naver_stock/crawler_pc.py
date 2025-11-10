@@ -720,7 +720,7 @@ class NaverStockCrawlerPC:
     # ASYNC VERSION - High Performance
     # ============================================================================
 
-    async def get_discussion_detail_async(self, session, stock_code, nid, stock_name=None):
+    async def get_discussion_detail_async(self, session, stock_code, nid, stock_name=None, isin_code=None):
         """
         Async version of get_discussion_detail
         Fetch discussion detail using aiohttp
@@ -801,6 +801,7 @@ class NaverStockCrawlerPC:
                     return {
                         'stock_code': stock_code,
                         'stock_name': stock_name,
+                        'isin_code': isin_code or '',
                         'comment_id': int(nid),
                         'author_name': author_name,
                         'date': post_date,
