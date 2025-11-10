@@ -782,7 +782,8 @@ class NaverStockCrawlerPC:
                         'content': full_content,
                         'likes_count': likes_count,
                         'dislikes_count': dislikes_count,
-                        'comment_data': comments
+                        'comment_data': comments,
+                        'source': 'naver'
                     }
 
             except asyncio.TimeoutError:

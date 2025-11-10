@@ -106,7 +106,7 @@ async def collect_metadata(stock_codes, start_date, end_date):
     return batch_map
 
 
-async def crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=50):
+async def crawl_and_save(batch_map, gcs_writer, stock_name_map, start_date, end_date, max_concurrent=50):
     """
     Phase 2: Crawl details by date and save to GCS
 
@@ -114,6 +114,8 @@ async def crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=5
         batch_map: {(stock_code, date_key): [nid_list]}
         gcs_writer: GCSParquetWriter instance
         stock_name_map: {stock_code: stock_name} mapping
+        start_date: Start date (datetime object)
+        end_date: End date (datetime object)
         max_concurrent: Max concurrent requests
 
     Returns:
@@ -163,8 +165,14 @@ async def crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=5
         for date_idx, (date_key, stock_nid_list) in enumerate(sorted(date_groups.items()), 1):
             logger.info(f"\n[Date {date_idx}/{len(date_groups)}] Processing {date_key}")
 
-            # Create buffer for this date
-            buffer = DatePartitionedBuffer(gcs_writer, buffer_size=1000, source='naver')
+            # Create buffer for this date (with date range for deletion)
+            buffer = DatePartitionedBuffer(
+                gcs_writer,
+                buffer_size=1000,
+                source='naver',
+                start_date=start_date,
+                end_date=end_date
+            )
 
             # Collect all NIDs for this date
             all_tasks = []
@@ -243,11 +251,21 @@ async def main():
     print(f'Started at: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     print()
 
-    # Get date range from command line or use default (today - 2 days to today)
+    # Parse command line arguments
+    # Usage: python main.py [start_date] [end_date] [stock_code1,stock_code2,...]
+    target_stock_codes = None  # None = load from source, otherwise use provided codes
+
     if len(sys.argv) >= 3:
-        # Command line arguments: python main.py 2025-01-01 2025-01-07
+        # Command line arguments: python main.py 2025-01-01 2025-01-07 [stock_codes]
         start_date_str = sys.argv[1]
         end_date_str = sys.argv[2]
+
+        # Check if stock codes are provided
+        if len(sys.argv) >= 4:
+            stock_codes_arg = sys.argv[3]
+            target_stock_codes = [code.strip() for code in stock_codes_arg.split(',')]
+            logger.info(f"Using specific stock codes: {target_stock_codes}")
+
         logger.info(f"Using date range from arguments: {start_date_str} ~ {end_date_str}")
     else:
         # Default: Last 3 days (today - 2 days to today)
@@ -283,32 +301,67 @@ async def main():
     print()
 
     # Load target stocks
-    stock_source = os.getenv('STOCK_SOURCE', 'csv')  # 'csv' or 'bigquery'
     stock_name_map = {}  # {stock_code: stock_name}
 
-    if stock_source == 'bigquery':
-        logger.info("Loading stocks from BigQuery...")
-        stock_codes, stock_name_map = load_stocks(
-            source='bigquery',
-            dataset_id=os.getenv('BQ_DATASET_ID'),
-            table_id=os.getenv('BQ_STOCK_TABLE_ID'),
-            project_id=os.getenv('GCP_PROJECT_ID'),
-            credentials_path=credentials_path,
-            code_column=os.getenv('BQ_STOCK_CODE_COLUMN', 'stock_code'),
-            name_column=os.getenv('BQ_STOCK_NAME_COLUMN', 'stock_name'),
-            filters=os.getenv('BQ_STOCK_FILTERS'),  # Optional WHERE clause
-            limit=int(os.getenv('BQ_LIMIT', 0)) or None  # 0 means no limit
-        )
+    if target_stock_codes:
+        # Use command-line provided stock codes
+        stock_codes = target_stock_codes
+        logger.info(f"Using {len(stock_codes)} stock codes from command line")
+
+        # Try to load names from source if available
+        stock_source = os.getenv('STOCK_SOURCE', 'csv')
+        try:
+            if stock_source == 'bigquery':
+                _, full_name_map = load_stocks(
+                    source='bigquery',
+                    dataset_id=os.getenv('BQ_DATASET_ID'),
+                    table_id=os.getenv('BQ_STOCK_TABLE_ID'),
+                    project_id=os.getenv('GCP_PROJECT_ID'),
+                    credentials_path=credentials_path,
+                    code_column=os.getenv('BQ_STOCK_CODE_COLUMN', 'stock_code'),
+                    name_column=os.getenv('BQ_STOCK_NAME_COLUMN', 'stock_name')
+                )
+                # Filter name map to only target codes
+                stock_name_map = {code: full_name_map.get(code, '') for code in stock_codes}
+            else:
+                csv_filename = os.getenv('STOCK_CSV_FILE', 'Market Data_top10.csv')
+                _, full_name_map = load_stocks(
+                    source='csv',
+                    filename=csv_filename,
+                    code_column='isu_cd',
+                    name_column='isu_nm'
+                )
+                stock_name_map = {code: full_name_map.get(code, '') for code in stock_codes}
+        except Exception as e:
+            logger.warning(f"Could not load stock names: {e}")
+            stock_name_map = {code: '' for code in stock_codes}
     else:
-        # Load from CSV (default)
-        csv_filename = os.getenv('STOCK_CSV_FILE', 'Market Data_top10.csv')
-        logger.info(f"Loading stocks from CSV: {csv_filename}")
-        stock_codes, stock_name_map = load_stocks(
-            source='csv',
-            filename=csv_filename,
-            code_column='isu_cd',
-            name_column='isu_nm'
-        )
+        # Load from configured source
+        stock_source = os.getenv('STOCK_SOURCE', 'csv')
+
+        if stock_source == 'bigquery':
+            logger.info("Loading stocks from BigQuery...")
+            stock_codes, stock_name_map = load_stocks(
+                source='bigquery',
+                dataset_id=os.getenv('BQ_DATASET_ID'),
+                table_id=os.getenv('BQ_STOCK_TABLE_ID'),
+                project_id=os.getenv('GCP_PROJECT_ID'),
+                credentials_path=credentials_path,
+                code_column=os.getenv('BQ_STOCK_CODE_COLUMN', 'stock_code'),
+                name_column=os.getenv('BQ_STOCK_NAME_COLUMN', 'stock_name'),
+                filters='target_stock = 1',  # Only load stocks with target_stock = 1
+                limit=int(os.getenv('BQ_LIMIT', 0)) or None  # 0 means no limit
+            )
+        else:
+            # Load from CSV (default)
+            csv_filename = os.getenv('STOCK_CSV_FILE', 'Market Data_top10.csv')
+            logger.info(f"Loading stocks from CSV: {csv_filename}")
+            stock_codes, stock_name_map = load_stocks(
+                source='csv',
+                filename=csv_filename,
+                code_column='isu_cd',
+                name_column='isu_nm'
+            )
 
     if not stock_codes:
         logger.error("No stock codes found")
@@ -326,23 +379,8 @@ async def main():
         logger.error(f"Failed to initialize GCS writer: {e}")
         sys.exit(1)
 
-    # Delete existing files for the date range (refresh)
-    print("=" * 80)
-    print("🗑️  Cleaning up existing files for date range...")
-    print("=" * 80)
-    try:
-        deleted_count = gcs_writer.delete_files_by_date_range(start_date, end_date, source='naver')
-        if deleted_count > 0:
-            print(f"✅ Deleted {deleted_count} existing files")
-        else:
-            print("✅ No existing files to delete")
-        print()
-    except Exception as e:
-        logger.warning(f"Failed to delete existing files (continuing anyway): {e}")
-        print(f"⚠️  Warning: Could not delete existing files: {e}")
-        print()
-
     # Start processing
+    # Note: Old files will be deleted per stock when saving new data
     start_time = time.time()
 
     try:
@@ -354,7 +392,7 @@ async def main():
             sys.exit(0)
 
         # Phase 2: Crawl and save
-        stats = await crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=50)
+        stats = await crawl_and_save(batch_map, gcs_writer, stock_name_map, start_date, end_date, max_concurrent=50)
 
         # Summary
         total_elapsed = time.time() - start_time

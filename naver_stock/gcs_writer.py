@@ -51,7 +51,7 @@ class GCSParquetWriter:
             self.batch_counters[date_key] += 1
         return self.batch_counters[date_key]
 
-    def save_batch(self, date_key, data, source='naver'):
+    def save_batch(self, date_key, data, source='naver', stock_code=None):
         """
         Save a batch of data to GCS with Hive-style partitioning
 
@@ -59,6 +59,7 @@ class GCSParquetWriter:
             date_key: Date in YYYYMMDD format (e.g., '20251101')
             data: List of dictionaries (discussion data)
             source: Data source name ('naver' or 'toss')
+            stock_code: Stock code for filename (optional, extracted from data if None)
 
         Returns:
             str: GCS file path
@@ -70,6 +71,10 @@ class GCSParquetWriter:
         try:
             # Convert to DataFrame
             df = pd.DataFrame(data)
+
+            # Extract stock_code if not provided
+            if stock_code is None and 'stock_code' in df.columns:
+                stock_code = df['stock_code'].iloc[0]
 
             # Add partition column (dt = YYYY-MM-DD format for BigQuery)
             if len(date_key) == 8:  # YYYYMMDD
@@ -90,6 +95,7 @@ class GCSParquetWriter:
                 ('likes_count', pa.int64()),
                 ('dislikes_count', pa.int64()),
                 ('comment_data', pa.string()),  # JSON stored as string
+                ('source', pa.string()),  # Data source (e.g., 'naver', 'toss')
                 ('dt', pa.string())  # Partition column
             ])
 
@@ -102,12 +108,19 @@ class GCSParquetWriter:
             buffer.seek(0)
 
             # Generate file path with Hive partitioning
-            # Format: [prefix/]dt=YYYY-MM-DD/source_batchN.parquet
-            batch_num = self._get_next_batch_number(date_key)
-            if self.gcs_prefix:
-                blob_path = f"{self.gcs_prefix}/dt={dt_value}/{source}_batch{batch_num}.parquet"
+            # Format: [prefix/]dt=YYYY-MM-DD/{stock_code}_{source}_batchN.parquet
+            batch_key = f"{date_key}_{stock_code}" if stock_code else date_key
+            batch_num = self._get_next_batch_number(batch_key)
+
+            if stock_code:
+                filename = f"{stock_code}_{source}_batch{batch_num}.parquet"
             else:
-                blob_path = f"dt={dt_value}/{source}_batch{batch_num}.parquet"
+                filename = f"{source}_batch{batch_num}.parquet"
+
+            if self.gcs_prefix:
+                blob_path = f"{self.gcs_prefix}/dt={dt_value}/{filename}"
+            else:
+                blob_path = f"dt={dt_value}/{filename}"
 
             # Upload to GCS
             blob = self.bucket.blob(blob_path)
@@ -167,6 +180,45 @@ class GCSParquetWriter:
         blobs = self.bucket.list_blobs(prefix=prefix)
         return [blob.name for blob in blobs]
 
+    def delete_files_by_stock(self, stock_code, start_date, end_date, source='naver'):
+        """
+        Delete all files for a specific stock within a date range
+
+        Args:
+            stock_code: Stock code (e.g., '005930')
+            start_date: Start date (datetime object)
+            end_date: End date (datetime object)
+            source: Data source name (e.g., 'naver', 'toss')
+
+        Returns:
+            int: Number of files deleted
+        """
+        from datetime import timedelta
+
+        deleted_count = 0
+        current_date = start_date
+
+        while current_date <= end_date:
+            date_key = current_date.strftime('%Y-%m-%d')
+            prefix = self.gcs_prefix + '/' if self.gcs_prefix else ''
+            prefix += f"dt={date_key}/{stock_code}_{source}_"
+
+            # List and delete blobs with this prefix
+            blobs = list(self.bucket.list_blobs(prefix=prefix))
+
+            if blobs:
+                for blob in blobs:
+                    blob.delete()
+                    logger.debug(f"Deleted: {blob.name}")
+                    deleted_count += 1
+
+            current_date += timedelta(days=1)
+
+        if deleted_count > 0:
+            logger.info(f"🗑️  Deleted {deleted_count} existing files for stock {stock_code}")
+
+        return deleted_count
+
     def delete_files_by_date_range(self, start_date, end_date, source='naver'):
         """
         Delete all files for a specific source within a date range
@@ -213,24 +265,31 @@ class GCSParquetWriter:
 
 class DatePartitionedBuffer:
     """
-    Buffer that accumulates data by date and auto-flushes to GCS
+    Buffer that accumulates data by date and stock_code, auto-flushes to GCS
     """
 
-    def __init__(self, gcs_writer, buffer_size=1000, source='naver'):
+    def __init__(self, gcs_writer, buffer_size=1000, source='naver', start_date=None, end_date=None):
         """
         Initialize buffer
 
         Args:
             gcs_writer: GCSParquetWriter instance
-            buffer_size: Number of rows before auto-flush
+            buffer_size: Number of rows before auto-flush (per stock)
             source: Data source name
+            start_date: Start date for deletion (datetime object)
+            end_date: End date for deletion (datetime object)
         """
         self.gcs_writer = gcs_writer
         self.buffer_size = buffer_size
         self.source = source
+        self.start_date = start_date
+        self.end_date = end_date
 
-        # Date-based buffers: {date_key: [data]}
+        # Date and stock-based buffers: {(date_key, stock_code): [data]}
         self.buffers = {}
+
+        # Track which stocks have been deleted
+        self.deleted_stocks = set()
 
     def add(self, post_date, data):
         """
@@ -238,7 +297,7 @@ class DatePartitionedBuffer:
 
         Args:
             post_date: datetime object or YYYYMMDD string
-            data: Dictionary of post data
+            data: Dictionary of post data (must contain 'stock_code')
         """
         # Convert datetime to date_key
         if isinstance(post_date, datetime):
@@ -246,51 +305,101 @@ class DatePartitionedBuffer:
         else:
             date_key = post_date
 
+        # Get stock_code from data
+        stock_code = data.get('stock_code')
+        if not stock_code:
+            logger.warning("Data missing stock_code, skipping")
+            return
+
+        # Create buffer key
+        buffer_key = (date_key, stock_code)
+
         # Initialize buffer if needed
-        if date_key not in self.buffers:
-            self.buffers[date_key] = []
+        if buffer_key not in self.buffers:
+            self.buffers[buffer_key] = []
 
         # Add data
-        self.buffers[date_key].append(data)
+        self.buffers[buffer_key].append(data)
 
         # Auto-flush if buffer is full
-        if len(self.buffers[date_key]) >= self.buffer_size:
-            self.flush(date_key)
+        if len(self.buffers[buffer_key]) >= self.buffer_size:
+            self.flush(date_key, stock_code)
 
-    def flush(self, date_key=None):
+    def flush(self, date_key=None, stock_code=None):
         """
-        Flush buffer to GCS
+        Flush buffer to GCS (deletes existing files for stock before saving)
 
         Args:
             date_key: Specific date to flush (None = flush all)
+            stock_code: Specific stock to flush (None = flush all for date)
 
         Returns:
             list: List of saved file paths
         """
         saved_files = []
 
-        if date_key:
-            # Flush specific date
-            if date_key in self.buffers and self.buffers[date_key]:
-                file_path = self.gcs_writer.save_batch(date_key, self.buffers[date_key], self.source)
+        if date_key and stock_code:
+            # Flush specific date + stock
+            buffer_key = (date_key, stock_code)
+            if buffer_key in self.buffers and self.buffers[buffer_key]:
+                # Delete existing files for this stock (once per stock)
+                if stock_code not in self.deleted_stocks and self.start_date and self.end_date:
+                    self.gcs_writer.delete_files_by_stock(
+                        stock_code, self.start_date, self.end_date, self.source
+                    )
+                    self.deleted_stocks.add(stock_code)
+
+                # Save new data
+                file_path = self.gcs_writer.save_batch(
+                    date_key, self.buffers[buffer_key], self.source, stock_code
+                )
                 if file_path:
                     saved_files.append(file_path)
-                self.buffers[date_key].clear()
-        else:
-            # Flush all dates
-            for dk in list(self.buffers.keys()):
-                if self.buffers[dk]:
-                    file_path = self.gcs_writer.save_batch(dk, self.buffers[dk], self.source)
+                self.buffers[buffer_key].clear()
+        elif date_key:
+            # Flush all stocks for specific date
+            keys_to_flush = [k for k in self.buffers.keys() if k[0] == date_key]
+            for buffer_key in keys_to_flush:
+                if self.buffers[buffer_key]:
+                    dk, sc = buffer_key
+
+                    # Delete existing files for this stock (once per stock)
+                    if sc not in self.deleted_stocks and self.start_date and self.end_date:
+                        self.gcs_writer.delete_files_by_stock(
+                            sc, self.start_date, self.end_date, self.source
+                        )
+                        self.deleted_stocks.add(sc)
+
+                    # Save new data
+                    file_path = self.gcs_writer.save_batch(dk, self.buffers[buffer_key], self.source, sc)
                     if file_path:
                         saved_files.append(file_path)
-                    self.buffers[dk].clear()
+                    self.buffers[buffer_key].clear()
+        else:
+            # Flush all dates and stocks
+            for buffer_key in list(self.buffers.keys()):
+                if self.buffers[buffer_key]:
+                    dk, sc = buffer_key
+
+                    # Delete existing files for this stock (once per stock)
+                    if sc not in self.deleted_stocks and self.start_date and self.end_date:
+                        self.gcs_writer.delete_files_by_stock(
+                            sc, self.start_date, self.end_date, self.source
+                        )
+                        self.deleted_stocks.add(sc)
+
+                    # Save new data
+                    file_path = self.gcs_writer.save_batch(dk, self.buffers[buffer_key], self.source, sc)
+                    if file_path:
+                        saved_files.append(file_path)
+                    self.buffers[buffer_key].clear()
 
         return saved_files
 
     def get_buffer_stats(self):
         """Get current buffer statistics"""
         return {
-            date_key: len(data)
-            for date_key, data in self.buffers.items()
+            f"{date_key}_{stock_code}": len(data)
+            for (date_key, stock_code), data in self.buffers.items()
             if data
         }
