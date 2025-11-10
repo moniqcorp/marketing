@@ -73,9 +73,9 @@ async def collect_metadata(stock_codes, start_date, end_date):
             logger.info(f"[{idx}/{len(stock_codes)}] Collecting metadata for stock {stock_code}")
 
             try:
-                # Get NIDs with dates
+                # Get NIDs with dates (unlimited pages, stops at start_date)
                 nid_date_pairs = await crawler.get_nids_with_dates_async(
-                    session, stock_code, start_date, end_date, max_pages=50
+                    session, stock_code, start_date, end_date
                 )
 
                 # Group by (stock_code, date)
@@ -106,7 +106,7 @@ async def collect_metadata(stock_codes, start_date, end_date):
     return batch_map
 
 
-async def crawl_and_save(batch_map, gcs_writer, stock_name_map, start_date, end_date, max_concurrent=50):
+async def crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=20):
     """
     Phase 2: Crawl details by date and save to GCS
 
@@ -114,8 +114,6 @@ async def crawl_and_save(batch_map, gcs_writer, stock_name_map, start_date, end_
         batch_map: {(stock_code, date_key): [nid_list]}
         gcs_writer: GCSParquetWriter instance
         stock_name_map: {stock_code: stock_name} mapping
-        start_date: Start date (datetime object)
-        end_date: End date (datetime object)
         max_concurrent: Max concurrent requests
 
     Returns:
@@ -165,13 +163,11 @@ async def crawl_and_save(batch_map, gcs_writer, stock_name_map, start_date, end_
         for date_idx, (date_key, stock_nid_list) in enumerate(sorted(date_groups.items()), 1):
             logger.info(f"\n[Date {date_idx}/{len(date_groups)}] Processing {date_key}")
 
-            # Create buffer for this date (with date range for deletion)
+            # Create buffer for this date
             buffer = DatePartitionedBuffer(
                 gcs_writer,
                 buffer_size=1000,
-                source='naver',
-                start_date=start_date,
-                end_date=end_date
+                source='naver'
             )
 
             # Collect all NIDs for this date
@@ -392,7 +388,7 @@ async def main():
             sys.exit(0)
 
         # Phase 2: Crawl and save
-        stats = await crawl_and_save(batch_map, gcs_writer, stock_name_map, start_date, end_date, max_concurrent=50)
+        stats = await crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=20)
 
         # Summary
         total_elapsed = time.time() - start_time

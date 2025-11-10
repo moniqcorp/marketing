@@ -248,7 +248,7 @@ class NaverStockCrawlerPC:
         logger.info(f"[ASYNC] Total discussions found: {len(nid_list)}")
         return nid_list, stock_name
 
-    async def get_nids_with_dates_async(self, session, stock_code, start_date=None, end_date=None, max_pages=50):
+    async def get_nids_with_dates_async(self, session, stock_code, start_date=None, end_date=None, max_pages=None):
         """
         Get NIDs with their dates from list pages (for date-based filtering)
 
@@ -257,7 +257,7 @@ class NaverStockCrawlerPC:
             stock_code: Stock code
             start_date: Start date (datetime object)
             end_date: End date (datetime object)
-            max_pages: Maximum pages to crawl
+            max_pages: Maximum pages to crawl (None = unlimited, stops when reaching start_date)
 
         Returns:
             list: [(nid, datetime), (nid, datetime), ...]
@@ -340,22 +340,43 @@ class NaverStockCrawlerPC:
 
         # Fetch pages sequentially (not concurrently) to enable early stopping
         all_nid_date_pairs = []
+        page = 1
 
-        for page in range(1, max_pages + 1):
+        # If max_pages is None, continue until we hit start_date or run out of pages
+        while True:
+            # Safety limit: stop at 1000 pages (extremely unlikely to reach this)
+            if page > 1000:
+                logger.warning(f"Reached safety limit of 1000 pages for stock {stock_code}")
+                break
+
             result = await fetch_page(page)
 
             if isinstance(result, tuple):
                 nid_date_pairs, should_stop = result
+
+                # Stop if no posts found on this page
+                if not nid_date_pairs and page > 1:
+                    logger.info(f"Stopping at page {page}: no more posts found")
+                    break
+
                 all_nid_date_pairs.extend(nid_date_pairs)
 
+                # Stop if we've reached posts older than start_date
                 if should_stop:
-                    logger.info(f"Stopping at page {page}: posts older than start_date")
+                    logger.info(f"Stopping at page {page}: posts older than start_date ({start_date.strftime('%Y-%m-%d')})")
                     break
             else:
                 # Old behavior compatibility
                 all_nid_date_pairs.extend(result)
 
-        logger.info(f"[ASYNC] Collected {len(all_nid_date_pairs)} NIDs with dates for stock {stock_code}")
+            # Check max_pages limit if specified
+            if max_pages and page >= max_pages:
+                logger.info(f"Reached max_pages limit: {max_pages}")
+                break
+
+            page += 1
+
+        logger.info(f"[ASYNC] Collected {len(all_nid_date_pairs)} NIDs with dates for stock {stock_code} ({page} pages)")
         return all_nid_date_pairs
 
     def get_discussion_detail(self, stock_code, nid, stock_name=None, retry_count=0):
@@ -772,6 +793,10 @@ class NaverStockCrawlerPC:
 
                     # Get comments via API (async)
                     comments = await self.get_comments_via_api_async(session, nid, stock_code)
+
+                    # Log successful retry if this wasn't the first attempt
+                    if attempt > 0:
+                        logger.info(f"✅ Retry successful for nid={nid} after {attempt + 1} attempts")
 
                     return {
                         'stock_code': stock_code,
