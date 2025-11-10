@@ -7,7 +7,7 @@ from app.common.logger import toss_logger
 
 async def fetch_cookies(body: dict):
     try:
-        async with AsyncBrowserClient(headless=False, browser_type="firefox") as client:
+        async with AsyncBrowserClient(headless=True, browser_type="firefox") as client:
             cookies = await client.get_cookies(
                 url="https://www.tossinvest.com/",
                 wait_for_cookies="XSRF-TOKEN",

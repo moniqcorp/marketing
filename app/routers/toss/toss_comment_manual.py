@@ -1,15 +1,27 @@
+import asyncio
 import json
+import os
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import zoneinfo
+from dotenv import load_dotenv
+import pandas as pd
+from google.cloud import storage
 from app.common.request_function import AsyncCurlClient
 from app.common.errors import TossError
 from app.common.logger import toss_logger
 from app.routers.toss.toss_cookies import fetch_cookies
 from fastapi import BackgroundTasks
 
+
+load_dotenv()
+
+
 KST = zoneinfo.ZoneInfo("Asia/Seoul")
+BASE_DIR = Path(__file__).resolve().parents[3]
+LOCAL_SAVE_DIR = BASE_DIR / "toss_comments"
+LOCAL_SAVE_DIR.mkdir(exist_ok=True)
 
 
 def _log_and_print(message: str):
@@ -22,17 +34,11 @@ async def fetch_comments_by_date(
     stock_code: str,
     cookies: dict,
     session: AsyncCurlClient,
+    start_time: datetime,
+    end_time: datetime,
     sort_type: str = "RECENT",
-    max_pages: int = 10000,
+    max_pages: int = 100000000,
 ):
-    """어제 ~ 30일 전 댓글 수집 (메모리에 저장)"""
-
-    now = datetime.now(KST)
-    end_time = now.replace(hour=23, minute=59, second=59, microsecond=0) - timedelta(
-        days=1
-    )
-    start_time = end_time.replace(hour=0, minute=0, second=0) - timedelta(days=2)
-
     url = "https://wts-cert-api.tossinvest.com/api/v3/comments"
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:143.0) Gecko/20100101 Firefox/143.0",
@@ -133,45 +139,181 @@ async def fetch_comments_by_date(
     return collected_comments
 
 
-# async def _background_fetch_comments(
-#     stock_code: str,
-#     cookies: dict,
-#     session: AsyncCurlClient,
-#     output_file: str = None,
-# ):
-#     """백그라운드 작업용 래퍼"""
-#     try:
-#         await fetch_comments_by_date(stock_code, cookies, session, output_file)
-#     except Exception as e:
-#         toss_logger.error(
-#             f"백그라운드 작업 실패 ({stock_code}): {traceback.format_exc()}"
-#         )
-#         print(f"백그라운드 작업 실패 ({stock_code}): {traceback.format_exc()}")
-#     finally:
-#         if session:
-#             try:
-#                 await session.close()
-#             except Exception as e:
-#                 toss_logger.error(f"세션 종료 중 에러: {e}")
+async def fetch_comments_reply(
+    cookies, comment, session=AsyncCurlClient, max_pages: int = 10
+):
+    url = f"https://wts-cert-api.tossinvest.com/api/v1/comments/{comment}/replies"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:144.0) Gecko/20100101 Firefox/144.0",
+        "Accept": "application/json",
+        "Accept-Language": "ko-KR,ko;q=0.8,en-US;q=0.5,en;q=0.3",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Referer": "https://www.tossinvest.com/stocks/US20170803003/community",
+        "browser-tab-id": "browser-tab-150929dbf77e45e795f9af3303c3247e",
+        "App-Version": "v251110.1623",
+        "Origin": "https://www.tossinvest.com",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+        "Priority": "u=4",
+    }
+    all_replies = []
+    next_reply_id = None
+
+    for page in range(max_pages):
+        if next_reply_id:  # 다음 페이지 기준 id
+            url = f"https://wts-cert-api.tossinvest.com/api/v1/comments/{comment}/replies?lastReplyId={next_reply_id}"
+
+        response, _ = await session.get(
+            url=url,
+            headers=headers,
+            cookies=cookies,
+            body_type="JSON",
+        )
+
+        results = response.get("result", {}).get("replies", {})
+        replies = results.get("body", [])
+        all_replies.extend(replies)
+
+        # 페이지네이션 제어
+        has_next = results.get("hasNext")
+        if not has_next or not replies:
+            break
+
+        # 다음 요청용 reply_id 갱신
+        next_reply_id = replies[-1].get("id")
+
+    return all_replies
 
 
-async def main(body: dict, background_tasks: BackgroundTasks):
-    """즉시 응답 + 수집한 댓글 데이터 반환"""
+async def merge_comments_and_replies(comments, cookies, session):
+    """
+    댓글 리스트에 replyCount > 0 인 항목의 대댓글을 병렬로 수집 후 병합한다.
+    최종 결과는 DB 스키마에 맞는 구조로 반환한다.
+    """
+    tasks = []
+    for comment in comments:
+        if int(comment.get("replyCount", 0)) > 0:
+            tasks.append(
+                fetch_comments_reply(cookies, comment["id"], session, max_pages=10)
+            )
+        else:
+            tasks.append(asyncio.sleep(0, result=[]))  # 대댓글 없을 시 빈 배열
+
+    replies_list = await asyncio.gather(*tasks)
+
+    merged = []
+    for comment, replies in zip(comments, replies_list):
+        updated = comment.get("updatedAt", "")
+        updated_fmt = datetime.fromisoformat(updated.replace("T", " ").split("+")[0])
+        merged.append(
+            {
+                "stock_code": comment.get("stockCode", "").replace("A", ""),
+                "isin_code": comment.get("subjectId", ""),
+                "stock_name": comment.get("topic", ""),
+                "comment_id": comment.get("id"),
+                "author_name": comment.get("author", {}).get("nickname", "unknown"),
+                "date": updated_fmt.strftime("%Y-%m-%d %H:%M:%S"),
+                "content": comment.get("message", ""),
+                "likes_count": int(comment.get("likeCount", 0)),
+                "dislikes_count": int(comment.get("dislikeCount", 0)),
+                "comment_data": json.dumps(replies, ensure_ascii=False),
+                "dt": datetime.fromisoformat(comment.get("updatedAt", "")).strftime(
+                    "%Y-%m-%d"
+                ),
+            }
+        )
+
+    return merged
+
+
+def upload_to_gcs(local_path: str, bucket_name: str, gcs_path: str) -> str:
+    """로컬 파일을 GCS로 업로드 후 gs:// 또는 https URL 반환"""
+    credentials_path = os.getenv("GCS_CREDENTIALS_PATH")
+    storage_client = storage.Client.from_service_account_json(credentials_path)
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(gcs_path)
+    blob.upload_from_filename(local_path)
+    return f"gs://{bucket_name}/{gcs_path}"
+
+
+def upload_by_partition(df: pd.DataFrame, stock_code: str) -> list:
+    """
+    dt 컬럼 기준으로 날짜별 parquet 분리 저장 후 GCS 업로드
+    - dt는 YYYY-MM-DD 형식
+    - GCS 경로 예: gs://bucket/marketing/stock_discussion/dt=2025-11-09/{stock_code}_2025-11-09.parquet
+    """
+    bucket_name = os.getenv("GCS_BUCKET_NAME")
+    if "dt" not in df.columns:
+        raise ValueError("DataFrame에 dt 컬럼이 없습니다. (날짜 파티션 키 필요)")
+
+    uploaded = []
+    for date_value in df["dt"].unique():
+        df_day = df[df["dt"] == date_value]
+
+        # 로컬 저장 경로
+        local_dir = LOCAL_SAVE_DIR / f"dt={date_value}"
+        local_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{stock_code}_{date_value}.parquet"
+        local_path = local_dir / filename
+
+        df_day.to_parquet(local_path, engine="pyarrow", index=False)
+
+        # GCS 업로드 경로 (Hive-style partition)
+        gcs_path = f"marketing/stock_discussion/dt={date_value}/{filename}"
+        parquet_url = upload_to_gcs(str(local_path), bucket_name, gcs_path)
+        uploaded.append(parquet_url)
+
+        _log_and_print(f"[{stock_code}] {date_value} 업로드 완료 → {parquet_url}")
+
+    return uploaded
+
+
+async def main(body: dict):
+    """댓글 + 대댓글 수집 후 날짜별로 GCS 업로드"""
     try:
         session = AsyncCurlClient()
         stock_code = body.get("stock_code")
         cookies = await fetch_cookies(body)
 
-        # 댓글 수집
-        comments = await fetch_comments_by_date(stock_code, cookies, session)
+        # 1️⃣ 입력값에서 날짜 변환
+        start_time = datetime.fromisoformat(body["start"].replace("/", "-")).astimezone(
+            KST
+        )
+        end_time = datetime.fromisoformat(body["end"].replace("/", "-")).astimezone(KST)
 
-        # 수집한 댓글 반환
+        # 2️⃣ 댓글 수집
+        comments = await fetch_comments_by_date(
+            stock_code, cookies, session, start_time, end_time
+        )
+        if not comments:
+            _log_and_print(f"[{stock_code}] 게시물 없음 → 업로드 스킵")
+            return {
+                "code": 204,
+                "message": f"[{stock_code}] 해당 기간 내 게시물 없음",
+                "stock_code": stock_code,
+                "total_comments": 0,
+            }
+
+        # 3️⃣ 대댓글 병합
+        comments_and_replies = await merge_comments_and_replies(
+            comments, cookies, session
+        )
+
+        # 4️⃣ DataFrame 변환
+        df = pd.DataFrame(comments_and_replies)
+
+        # 5️⃣ 날짜별 parquet 저장 및 업로드
+        parquet_urls = upload_by_partition(df, stock_code)
+
         return {
             "code": 200,
-            "message": f"댓글 수집 완료",
+            "message": "댓글 + 대댓글 수집 및 업로드 완료",
             "stock_code": stock_code,
-            "total_comments": len(comments),
-            "comments": comments,  # 수집한 댓글 데이터
+            "total_comments": len(df),
+            "partitions": len(parquet_urls),
+            "parquet_urls": parquet_urls,
         }
 
     except TossError as e:
