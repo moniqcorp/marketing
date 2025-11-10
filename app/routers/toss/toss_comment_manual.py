@@ -222,6 +222,7 @@ async def merge_comments_and_replies(comments, cookies, session):
                 "dt": datetime.fromisoformat(comment.get("updatedAt", "")).strftime(
                     "%Y-%m-%d"
                 ),
+                "source": "toss",
             }
         )
 
