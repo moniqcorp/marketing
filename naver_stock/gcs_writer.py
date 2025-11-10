@@ -288,6 +288,9 @@ class DatePartitionedBuffer:
         # Track which stock+date combinations have been deleted: {(stock_code, date_key)}
         self.deleted_stocks = set()
 
+        # Track all saved files (including auto-flushed files)
+        self.all_saved_files = []
+
     def add(self, post_date, data):
         """
         Add data to buffer
@@ -320,7 +323,8 @@ class DatePartitionedBuffer:
 
         # Auto-flush if buffer is full
         if len(self.buffers[buffer_key]) >= self.buffer_size:
-            self.flush(date_key, stock_code)
+            saved = self.flush(date_key, stock_code)
+            self.all_saved_files.extend(saved)
 
     def flush(self, date_key=None, stock_code=None):
         """
@@ -331,7 +335,7 @@ class DatePartitionedBuffer:
             stock_code: Specific stock to flush (None = flush all for date)
 
         Returns:
-            list: List of saved file paths
+            list: List of saved file paths (only from this flush, not cumulative)
         """
         saved_files = []
 
@@ -351,6 +355,7 @@ class DatePartitionedBuffer:
                 )
                 if file_path:
                     saved_files.append(file_path)
+                    self.all_saved_files.append(file_path)  # Track all files
                 self.buffers[buffer_key].clear()
         elif date_key:
             # Flush all stocks for specific date
@@ -369,6 +374,7 @@ class DatePartitionedBuffer:
                     file_path = self.gcs_writer.save_batch(dk, self.buffers[buffer_key], self.source, sc)
                     if file_path:
                         saved_files.append(file_path)
+                        self.all_saved_files.append(file_path)  # Track all files
                     self.buffers[buffer_key].clear()
         else:
             # Flush all dates and stocks
@@ -386,6 +392,7 @@ class DatePartitionedBuffer:
                     file_path = self.gcs_writer.save_batch(dk, self.buffers[buffer_key], self.source, sc)
                     if file_path:
                         saved_files.append(file_path)
+                        self.all_saved_files.append(file_path)  # Track all files
                     self.buffers[buffer_key].clear()
 
         return saved_files
@@ -420,3 +427,12 @@ class DatePartitionedBuffer:
             for (date_key, stock_code), data in self.buffers.items()
             if data
         }
+
+    def get_all_saved_files(self):
+        """
+        Get all saved files including auto-flushed files
+
+        Returns:
+            list: All file paths saved during this session
+        """
+        return self.all_saved_files.copy()

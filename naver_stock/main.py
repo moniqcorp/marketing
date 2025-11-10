@@ -160,16 +160,16 @@ async def crawl_and_save(batch_map, gcs_writer, stock_name_map, stock_isin_map, 
         cookies={'hide_cleanbot_contents': 'off'}
     ) as session:
 
+        # Create single buffer for all dates (to track all saved files)
+        buffer = DatePartitionedBuffer(
+            gcs_writer,
+            buffer_size=1000,
+            source='naver'
+        )
+
         # Process each date
         for date_idx, (date_key, stock_nid_list) in enumerate(sorted(date_groups.items()), 1):
             logger.info(f"\n[Date {date_idx}/{len(date_groups)}] Processing {date_key}")
-
-            # Create buffer for this date
-            buffer = DatePartitionedBuffer(
-                gcs_writer,
-                buffer_size=1000,
-                source='naver'
-            )
 
             # Collect all NIDs for this date
             all_tasks = []
@@ -230,11 +230,14 @@ async def crawl_and_save(batch_map, gcs_writer, stock_name_map, stock_isin_map, 
                         buffer.add(date_key, post)
                     stats['total_posts'] += 1
 
-            # Flush remaining buffer
+            # Flush remaining buffer for this date
             saved = buffer.flush()
-            stats['saved_files'].extend(saved)
+            # Don't need to extend here, already tracked in buffer.all_saved_files
 
             logger.info(f"  ✅ Saved {len(results)} posts to {len(saved)} files")
+
+        # Get all saved files from buffer (includes all auto-flushed files)
+        stats['saved_files'] = buffer.get_all_saved_files()
 
     logger.info("=" * 60)
     logger.info("Phase 2 Complete")
