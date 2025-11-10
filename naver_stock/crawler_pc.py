@@ -12,7 +12,7 @@ import logging
 import re
 import asyncio
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 import requests
@@ -138,6 +138,225 @@ class NaverStockCrawlerPC:
 
         logger.info(f"Total discussions found: {len(nid_list)}")
         return nid_list, stock_name
+
+    async def get_discussion_list_async(self, session, stock_code, max_pages=10):
+        """
+        Async version of get_discussion_list - fetches all pages concurrently
+
+        Args:
+            session: aiohttp ClientSession
+            stock_code: Stock code (e.g., '005930')
+            max_pages: Maximum number of pages to crawl
+
+        Returns:
+            tuple: (nid_list, stock_name)
+        """
+        logger.info(f"🔓 [ASYNC] Cleanbot disabled - fetching all posts including cleanbot-filtered ones")
+
+        async def fetch_page(page_num):
+            """Fetch a single page and return parsed data"""
+            try:
+                url = f"{self.base_url}/item/board.naver?code={stock_code}&page={page_num}"
+                logger.debug(f"[ASYNC] Fetching list page {page_num}: {url}")
+
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        logger.warning(f"HTTP {response.status} for page {page_num}")
+                        return [], None, page_num
+
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+
+                    # Extract stock name (from page 1)
+                    stock_name = None
+                    if page_num == 1:
+                        stock_name_elem = soup.select_one('.wrap_company h2 a')
+                        if stock_name_elem:
+                            stock_name = stock_name_elem.text.strip()
+
+                    # Parse discussion table
+                    table = soup.select_one('table.type2')
+                    if not table:
+                        logger.warning(f"Table not found on page {page_num}")
+                        return [], stock_name, page_num
+
+                    rows = table.select('tbody tr')
+                    page_nids = []
+
+                    for row in rows:
+                        # Skip blank rows
+                        if row.get('class') and 'blank_row' in row.get('class'):
+                            continue
+
+                        # Skip cleanbot UI row
+                        if 'u_cbox_cleanbot' in str(row):
+                            continue
+
+                        cells = row.select('td')
+                        if len(cells) < 6:
+                            continue
+
+                        # Extract title link
+                        title_link = cells[1].select_one('a')
+                        if not title_link:
+                            continue
+
+                        href = title_link.get('href', '')
+
+                        # Extract nid using regex
+                        nid_match = re.search(r'nid=(\d+)', href)
+                        if not nid_match:
+                            continue
+
+                        nid = nid_match.group(1)
+                        page_nids.append(nid)
+
+                    return page_nids, stock_name, page_num
+
+            except Exception as e:
+                logger.error(f"Error fetching page {page_num}: {e}")
+                return [], None, page_num
+
+        # Fetch all pages concurrently
+        tasks = [fetch_page(page) for page in range(1, max_pages + 1)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Combine results
+        nid_list = []
+        stock_name = None
+
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Task failed: {result}")
+                continue
+
+            page_nids, page_stock_name, page_num = result
+
+            # Get stock name from page 1
+            if page_num == 1 and page_stock_name:
+                stock_name = page_stock_name
+                logger.info(f"Stock name: {stock_name}")
+
+            # Add unique nids
+            for nid in page_nids:
+                if nid not in nid_list:
+                    nid_list.append(nid)
+
+            if page_nids:
+                logger.info(f"Page {page_num}: Found {len(page_nids)} discussions")
+
+        logger.info(f"[ASYNC] Total discussions found: {len(nid_list)}")
+        return nid_list, stock_name
+
+    async def get_nids_with_dates_async(self, session, stock_code, start_date=None, end_date=None, max_pages=50):
+        """
+        Get NIDs with their dates from list pages (for date-based filtering)
+
+        Args:
+            session: aiohttp ClientSession
+            stock_code: Stock code
+            start_date: Start date (datetime object)
+            end_date: End date (datetime object)
+            max_pages: Maximum pages to crawl
+
+        Returns:
+            list: [(nid, datetime), (nid, datetime), ...]
+        """
+        logger.info(f"[ASYNC] Collecting NIDs with dates for stock {stock_code}")
+        if start_date:
+            logger.info(f"  Start date: {start_date.strftime('%Y-%m-%d')}")
+        if end_date:
+            logger.info(f"  End date: {end_date.strftime('%Y-%m-%d')}")
+
+        async def fetch_page(page_num):
+            """Fetch a single page and return NID-date pairs"""
+            try:
+                url = f"{self.base_url}/item/board.naver?code={stock_code}&page={page_num}"
+
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        logger.warning(f"HTTP {response.status} for page {page_num}")
+                        return []
+
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+
+                    # Parse discussion table
+                    table = soup.select_one('table.type2')
+                    if not table:
+                        return []
+
+                    rows = table.select('tbody tr')
+                    nid_date_pairs = []
+                    should_stop = False
+
+                    for row in rows:
+                        # Skip blank rows and cleanbot UI
+                        if row.get('class') and 'blank_row' in row.get('class'):
+                            continue
+                        if 'u_cbox_cleanbot' in str(row):
+                            continue
+
+                        cells = row.select('td')
+                        if len(cells) < 6:
+                            continue
+
+                        # Extract NID
+                        title_link = cells[1].select_one('a')
+                        if not title_link:
+                            continue
+
+                        href = title_link.get('href', '')
+                        nid_match = re.search(r'nid=(\d+)', href)
+                        if not nid_match:
+                            continue
+
+                        nid = nid_match.group(1)
+
+                        # Extract date from first column (cells[0])
+                        date_text = cells[0].get_text(strip=True)
+                        post_date = self.parse_list_date(date_text)
+
+                        if not post_date:
+                            logger.warning(f"Could not parse date: {date_text}")
+                            continue
+
+                        # Date filtering
+                        if start_date and post_date < start_date:
+                            should_stop = True  # Older than start_date, stop pagination
+                            break
+
+                        if end_date and post_date > end_date:
+                            continue  # Newer than end_date, skip this post
+
+                        nid_date_pairs.append((nid, post_date))
+
+                    logger.debug(f"Page {page_num}: Found {len(nid_date_pairs)} posts in date range")
+                    return nid_date_pairs, should_stop
+
+            except Exception as e:
+                logger.error(f"Error fetching page {page_num}: {e}")
+                return [], False
+
+        # Fetch pages sequentially (not concurrently) to enable early stopping
+        all_nid_date_pairs = []
+
+        for page in range(1, max_pages + 1):
+            result = await fetch_page(page)
+
+            if isinstance(result, tuple):
+                nid_date_pairs, should_stop = result
+                all_nid_date_pairs.extend(nid_date_pairs)
+
+                if should_stop:
+                    logger.info(f"Stopping at page {page}: posts older than start_date")
+                    break
+            else:
+                # Old behavior compatibility
+                all_nid_date_pairs.extend(result)
+
+        logger.info(f"[ASYNC] Collected {len(all_nid_date_pairs)} NIDs with dates for stock {stock_code}")
+        return all_nid_date_pairs
 
     def get_discussion_detail(self, stock_code, nid, stock_name=None, retry_count=0):
         """
@@ -374,6 +593,53 @@ class NaverStockCrawlerPC:
             logger.warning(f"Date parsing error: {e} for date_str={date_str}")
             return None
 
+    def parse_list_date(self, date_text):
+        """
+        Parse date from discussion list page
+        Handles formats like: "2025.11.01", "11.01", "2시간 전", "1분 전"
+
+        Args:
+            date_text: Date text from list page
+
+        Returns:
+            datetime: Parsed datetime object (or None if parsing fails)
+        """
+        if not date_text:
+            return None
+
+        date_text = date_text.strip()
+        now = datetime.now()
+
+        try:
+            # Format: "2025.11.01 14:32" or "2025.11.01" or "11.01"
+            if '.' in date_text:
+                # Remove time part if exists (e.g., "2025.11.10 14:32" -> "2025.11.10")
+                date_part = date_text.split()[0] if ' ' in date_text else date_text
+                parts = date_part.split('.')
+
+                if len(parts) == 3:  # "2025.11.01"
+                    return datetime(int(parts[0]), int(parts[1]), int(parts[2]))
+                elif len(parts) == 2:  # "11.01" - assume current year
+                    return datetime(now.year, int(parts[0]), int(parts[1]))
+
+            # Format: "N시간 전", "N분 전", "N초 전"
+            if '시간' in date_text:
+                hours = int(re.search(r'(\d+)', date_text).group(1))
+                return now - timedelta(hours=hours)
+            elif '분' in date_text:
+                minutes = int(re.search(r'(\d+)', date_text).group(1))
+                return now - timedelta(minutes=minutes)
+            elif '초' in date_text:
+                seconds = int(re.search(r'(\d+)', date_text).group(1))
+                return now - timedelta(seconds=seconds)
+
+            logger.warning(f"Unknown date format: {date_text}")
+            return None
+
+        except Exception as e:
+            logger.warning(f"Error parsing list date '{date_text}': {e}")
+            return None
+
     def crawl_stock_discussions(self, stock_code, max_posts=50, max_workers=10):
         """
         Main method: Get list then fetch details in parallel
@@ -497,9 +763,9 @@ class NaverStockCrawlerPC:
 
                     full_content = f"{title}\n\n{content_text}"
 
-                    # Parse date
-                    reg_date = discussion_data.get('regDate', '')
-                    post_date = self.parse_date(reg_date)
+                    # Parse date (API uses 'writtenAt' field, not 'regDate')
+                    written_at = discussion_data.get('writtenAt', '')
+                    post_date = self.parse_date(written_at)
 
                     likes_count = discussion_data.get('recommendCount', 0)
                     dislikes_count = discussion_data.get('notRecommendCount', 0)
@@ -615,28 +881,15 @@ class NaverStockCrawlerPC:
         """
         logger.info(f"[ASYNC] Starting to crawl stock {stock_code}")
 
-        # Step 1: Get discussion list (sync - fast enough)
-        nid_list, stock_name = self.get_discussion_list(stock_code, max_pages=10)
-
-        if not nid_list:
-            logger.warning(f"No discussions found for stock {stock_code}")
-            return []
-
-        # Limit to max_posts
-        nid_list = nid_list[:max_posts]
-
-        # Step 2: Fetch details in parallel with async
-        logger.info(f"[ASYNC] Fetching {len(nid_list)} discussions with max {max_concurrent} concurrent requests...")
-
-        results = []
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        async def fetch_with_semaphore(session, nid):
-            async with semaphore:
-                return await self.get_discussion_detail_async(session, stock_code, nid, stock_name)
-
-        # Create aiohttp session with cookie
-        connector = aiohttp.TCPConnector(limit=max_concurrent, limit_per_host=max_concurrent)
+        # Create aiohttp session with optimized connection pooling
+        connector = aiohttp.TCPConnector(
+            limit=150,                      # Total connection limit (increased from 50)
+            limit_per_host=100,             # Per-host limit (increased from 50)
+            ttl_dns_cache=300,              # DNS cache for 5 minutes
+            enable_cleanup_closed=True,     # Auto-cleanup closed connections
+            force_close=False,              # Enable keep-alive
+            keepalive_timeout=60            # Keep-alive timeout 60s
+        )
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=30)
 
         async with aiohttp.ClientSession(
@@ -645,7 +898,27 @@ class NaverStockCrawlerPC:
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
             cookies={'hide_cleanbot_contents': 'off'}
         ) as session:
-            tasks = [fetch_with_semaphore(session, nid) for nid in nid_list]
+            # Step 1: Get discussion list (ASYNC - 10 pages concurrently)
+            nid_list, stock_name = await self.get_discussion_list_async(session, stock_code, max_pages=10)
+
+            if not nid_list:
+                logger.warning(f"No discussions found for stock {stock_code}")
+                return []
+
+            # Limit to max_posts
+            nid_list = nid_list[:max_posts]
+
+            # Step 2: Fetch details in parallel with async
+            logger.info(f"[ASYNC] Fetching {len(nid_list)} discussions with max {max_concurrent} concurrent requests...")
+
+            results = []
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def fetch_with_semaphore(nid):
+                async with semaphore:
+                    return await self.get_discussion_detail_async(session, stock_code, nid, stock_name)
+
+            tasks = [fetch_with_semaphore(nid) for nid in nid_list]
 
             # Gather all results
             completed_results = await asyncio.gather(*tasks, return_exceptions=True)

@@ -1,269 +1,391 @@
 """
-Main script for Naver Stock Discussion Crawler (PC Version)
-Reads target stock codes and crawls discussion data
-Uses requests + BeautifulSoup for better performance
+Main script for Naver Stock Discussion Crawler (GCS Version)
+- Pure async architecture (no ProcessPoolExecutor)
+- Date-based filtering
+- Streaming save to GCS in Parquet format with Hive partitioning (dt=YYYY-MM-DD)
+- Memory-efficient batch processing
+- Supports CSV and BigQuery stock sources
 """
 
 import os
 import sys
 import time
+import json
 import logging
 import asyncio
-import pandas as pd
+import aiohttp
 from datetime import datetime
 from dotenv import load_dotenv
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from crawler_pc import NaverStockCrawlerPC
-from database import Database
+from gcs_writer import GCSParquetWriter, DatePartitionedBuffer
+from bigquery_utils import load_stocks
 
 # Load environment variables
 load_dotenv()
 
-# logs 디렉터리 생성 (로그 파일을 사용하지 않더라도 경로 참조 오류 방지)
-os.makedirs('logs', exist_ok=True)
-
-# Generate timestamp-based log filename
-log_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-log_filename = f'logs/crawler_{log_timestamp}.log'
-
 # Configure logging
-# (파일 저장은 주석 처리됨, 콘솔로만 출력)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        # logging.FileHandler(log_filename, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
 
-def read_target_stocks(filename='Market Data_top10.csv'):
+async def collect_metadata(stock_codes, start_date, end_date):
     """
-    Read stock codes from CSV file
+    Phase 1: Collect metadata (NID + date) for all stocks
 
     Args:
-        filename: Path to CSV file
+        stock_codes: List of stock codes
+        start_date: Start date (datetime)
+        end_date: End date (datetime)
 
     Returns:
-        list: List of stock codes
+        dict: {(stock_code, date_key): [nid_list]}
     """
-    stock_codes = []
+    logger.info("=" * 60)
+    logger.info("PHASE 1: Collecting metadata (NIDs with dates)")
+    logger.info("=" * 60)
 
-    try:
-        df = pd.read_csv(filename, dtype={'stock_code': str})
-        # 'isu_cd' 컬럼에서 종목 코드를 읽어옵니다.
-        stock_codes = df['isu_cd'].tolist()
-        logger.info(f"Loaded {len(stock_codes)} stock codes from {filename}")
+    batch_map = {}  # {(stock_code, date_key): [nid_list]}
+    crawler = NaverStockCrawlerPC()
 
-    except FileNotFoundError:
-        logger.error(f"Target file not found: {filename}")
-        sys.exit(1)
-        
-    except KeyError:
-        logger.error(f"Column 'isu_cd' not found in {filename}.")
-        logger.error("Please check the CSV file header.")
-        sys.exit(1)
+    # Create aiohttp session
+    connector = aiohttp.TCPConnector(
+        limit=150,
+        limit_per_host=100,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+        force_close=False,
+        keepalive_timeout=60
+    )
+    timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=30)
 
-    except Exception as e:
-        logger.error(f"Error reading target file: {e}")
-        sys.exit(1)
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+        cookies={'hide_cleanbot_contents': 'off'}
+    ) as session:
 
-    return stock_codes
+        for idx, stock_code in enumerate(stock_codes, 1):
+            logger.info(f"[{idx}/{len(stock_codes)}] Collecting metadata for stock {stock_code}")
+
+            try:
+                # Get NIDs with dates
+                nid_date_pairs = await crawler.get_nids_with_dates_async(
+                    session, stock_code, start_date, end_date, max_pages=50
+                )
+
+                # Group by (stock_code, date)
+                for nid, post_date in nid_date_pairs:
+                    date_key = post_date.strftime('%Y%m%d')
+                    key = (stock_code, date_key)
+
+                    if key not in batch_map:
+                        batch_map[key] = []
+                    batch_map[key].append(nid)
+
+                logger.info(f"  Found {len(nid_date_pairs)} posts in date range")
+
+            except Exception as e:
+                logger.error(f"Error collecting metadata for stock {stock_code}: {e}")
+
+    # Summary
+    total_nids = sum(len(nids) for nids in batch_map.values())
+    unique_dates = len(set(key[1] for key in batch_map.keys()))
+
+    logger.info("=" * 60)
+    logger.info(f"Phase 1 Complete:")
+    logger.info(f"  Total posts: {total_nids}")
+    logger.info(f"  Unique dates: {unique_dates}")
+    logger.info(f"  Stock-Date pairs: {len(batch_map)}")
+    logger.info("=" * 60)
+
+    return batch_map
 
 
-def process_single_stock(stock_code, max_posts, max_concurrent=50):
+async def crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=50):
     """
-    Process a single stock code - for use in parallel processing
-    (This function runs in a separate process)
-    Uses ASYNC crawler for high performance
+    Phase 2: Crawl details by date and save to GCS
+
+    Args:
+        batch_map: {(stock_code, date_key): [nid_list]}
+        gcs_writer: GCSParquetWriter instance
+        stock_name_map: {stock_code: stock_name} mapping
+        max_concurrent: Max concurrent requests
+
+    Returns:
+        dict: Statistics
     """
-    start_time = time.time()
+    logger.info("=" * 60)
+    logger.info("PHASE 2: Crawling details and streaming to GCS")
+    logger.info("=" * 60)
 
-    try:
-        crawler = NaverStockCrawlerPC()
+    # Reorganize by date
+    date_groups = {}  # {date_key: [(stock_code, [nids])]}
+    for (stock_code, date_key), nids in batch_map.items():
+        if date_key not in date_groups:
+            date_groups[date_key] = []
+        date_groups[date_key].append((stock_code, nids))
 
-        # Run async crawler in this process's event loop
-        discussions = asyncio.run(
-            crawler.crawl_stock_discussions_async(
-                stock_code,
-                max_posts=max_posts,
-                max_concurrent=max_concurrent
-            )
-        )
+    logger.info(f"Processing {len(date_groups)} unique dates")
 
-        elapsed = time.time() - start_time
-        return (stock_code, discussions, elapsed)
+    # Statistics
+    stats = {
+        'total_posts': 0,
+        'saved_files': [],
+        'errors': 0
+    }
 
-    except Exception as e:
-        # 자식 프로세스에서 발생한 에러 로깅
-        logger_sp = logging.getLogger(__name__)
-        logger_sp.error(f"Error in child process for stock {stock_code}: {e}")
-        elapsed = time.time() - start_time
-        return (stock_code, None, elapsed)
+    crawler = NaverStockCrawlerPC()
+
+    # Create aiohttp session
+    connector = aiohttp.TCPConnector(
+        limit=150,
+        limit_per_host=100,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+        force_close=False,
+        keepalive_timeout=60
+    )
+    timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=30)
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+        cookies={'hide_cleanbot_contents': 'off'}
+    ) as session:
+
+        # Process each date
+        for date_idx, (date_key, stock_nid_list) in enumerate(sorted(date_groups.items()), 1):
+            logger.info(f"\n[Date {date_idx}/{len(date_groups)}] Processing {date_key}")
+
+            # Create buffer for this date
+            buffer = DatePartitionedBuffer(gcs_writer, buffer_size=1000, source='naver')
+
+            # Collect all NIDs for this date
+            all_tasks = []
+            for stock_code, nids in stock_nid_list:
+                for nid in nids:
+                    all_tasks.append((stock_code, nid))
+
+            logger.info(f"  Total posts to crawl: {len(all_tasks)}")
+
+            # Create semaphore for concurrency control
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def fetch_with_semaphore(stock_code, nid):
+                """Fetch single post with semaphore"""
+                async with semaphore:
+                    try:
+                        # Get stock name from mapping
+                        stock_name = stock_name_map.get(stock_code)
+                        post = await crawler.get_discussion_detail_async(
+                            session, stock_code, nid, stock_name=stock_name
+                        )
+                        if post:
+                            # Convert comment_data to JSON string
+                            if 'comment_data' in post:
+                                post['comment_data'] = json.dumps(post['comment_data'], ensure_ascii=False)
+                            return post
+                        return None
+                    except Exception as e:
+                        logger.error(f"Error fetching nid={nid}: {e}")
+                        stats['errors'] += 1
+                        return None
+
+            # Fetch all posts concurrently
+            results = await asyncio.gather(*[
+                fetch_with_semaphore(stock_code, nid)
+                for stock_code, nid in all_tasks
+            ])
+
+            # Add to buffer and save
+            # Use each post's actual date for partitioning (not the search date_key)
+            for post in results:
+                if post:
+                    # Extract date from post and use it for partitioning
+                    post_date_str = post.get('date')  # "2025-11-08 20:10:23"
+                    if post_date_str:
+                        # Extract just the date part for partitioning
+                        post_date_only = post_date_str.split()[0] if ' ' in post_date_str else post_date_str
+                        # Convert to YYYYMMDD format for buffer
+                        post_date_key = post_date_only.replace('-', '')
+                        buffer.add(post_date_key, post)
+                    else:
+                        # Fallback to search date if post date is missing
+                        logger.warning(f"Post missing date field, using search date: {date_key}")
+                        buffer.add(date_key, post)
+                    stats['total_posts'] += 1
+
+            # Flush remaining buffer
+            saved = buffer.flush()
+            stats['saved_files'].extend(saved)
+
+            logger.info(f"  ✅ Saved {len(results)} posts to {len(saved)} files")
+
+    logger.info("=" * 60)
+    logger.info("Phase 2 Complete")
+    logger.info("=" * 60)
+
+    return stats
 
 
-def main():
+async def main():
     """Main execution function"""
 
     print('=' * 80)
-    print('Naver Stock Discussion Crawler (PC Version)')
+    print('Naver Stock Discussion Crawler (GCS Version)')
     print('=' * 80)
     print(f'Started at: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
-    # print(f'Log file: {log_filename}') # 로그 파일 저장 안 함
     print()
 
-    logger.info("=" * 60)
-    logger.info("Naver Stock Discussion Crawler Started")
-    # logger.info(f"Log file: {log_filename}")
-    logger.info("=" * 60)
+    # Get date range from command line or use default (today - 2 days to today)
+    if len(sys.argv) >= 3:
+        # Command line arguments: python main.py 2025-01-01 2025-01-07
+        start_date_str = sys.argv[1]
+        end_date_str = sys.argv[2]
+        logger.info(f"Using date range from arguments: {start_date_str} ~ {end_date_str}")
+    else:
+        # Default: Last 3 days (today - 2 days to today)
+        from datetime import timedelta
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        start_date = today - timedelta(days=2)
+        end_date = today
+        start_date_str = start_date.strftime("%Y-%m-%d")
+        end_date_str = end_date.strftime("%Y-%m-%d")
+        logger.info(f"Using default date range (last 3 days): {start_date_str} ~ {end_date_str}")
 
-    # Configuration
-    max_workers = int(os.getenv('MAX_THREADS', 10))
-    max_posts = int(os.getenv('MAX_POSTS', 50))
-    stock_processes = int(os.getenv('STOCK_PROCESSES', 2))
+    try:
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+        end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+    except ValueError as e:
+        logger.error(f"Invalid date format: {e}")
+        logger.error("Usage: python main.py [start_date] [end_date]")
+        logger.error("Example: python main.py 2025-01-01 2025-01-07")
+        sys.exit(1)
 
-    logger.info(f"Configuration:")
-    logger.info(f"  - Max Workers (detail crawling): {max_workers}")
-    logger.info(f"  - Max Posts per Stock: {max_posts}")
-    logger.info(f"  - Stock Processes (parallel stocks): {stock_processes}")
+    print(f"\n✅ Date range: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
 
-    # Read target stocks
-    stock_codes = read_target_stocks('Market Data_top10.csv')
+    # GCS configuration
+    bucket_name = os.getenv('GCS_BUCKET_NAME')
+    credentials_path = os.getenv('GCS_CREDENTIALS_PATH')
+    gcs_prefix = os.getenv('GCS_PREFIX')
+
+    if not bucket_name:
+        logger.error("GCS_BUCKET_NAME not set in .env file")
+        sys.exit(1)
+
+    print(f"☁️  GCS Bucket: {bucket_name}")
+    print()
+
+    # Load target stocks
+    stock_source = os.getenv('STOCK_SOURCE', 'csv')  # 'csv' or 'bigquery'
+    stock_name_map = {}  # {stock_code: stock_name}
+
+    if stock_source == 'bigquery':
+        logger.info("Loading stocks from BigQuery...")
+        stock_codes, stock_name_map = load_stocks(
+            source='bigquery',
+            dataset_id=os.getenv('BQ_DATASET_ID'),
+            table_id=os.getenv('BQ_STOCK_TABLE_ID'),
+            project_id=os.getenv('GCP_PROJECT_ID'),
+            credentials_path=credentials_path,
+            code_column=os.getenv('BQ_STOCK_CODE_COLUMN', 'stock_code'),
+            name_column=os.getenv('BQ_STOCK_NAME_COLUMN', 'stock_name'),
+            filters=os.getenv('BQ_STOCK_FILTERS'),  # Optional WHERE clause
+            limit=int(os.getenv('BQ_LIMIT', 0)) or None  # 0 means no limit
+        )
+    else:
+        # Load from CSV (default)
+        csv_filename = os.getenv('STOCK_CSV_FILE', 'Market Data_top10.csv')
+        logger.info(f"Loading stocks from CSV: {csv_filename}")
+        stock_codes, stock_name_map = load_stocks(
+            source='csv',
+            filename=csv_filename,
+            code_column='isu_cd',
+            name_column='isu_nm'
+        )
 
     if not stock_codes:
-        logger.error("No stock codes found in CSV file")
+        logger.error("No stock codes found")
         sys.exit(1)
 
-    print(f"Target stocks: {len(stock_codes)} stocks")
-    print(f"Posts per stock: {max_posts}")
-    print(f"Workers: {max_workers}")
-    print(f"Stock processes: {stock_processes}")
+    logger.info(f"Loaded {len(stock_codes)} stocks with names")
+    print(f"📊 Target stocks: {len(stock_codes)}")
     print()
 
-    db = None # finally에서 db 객체를 참조할 수 있도록 외부에 선언
-    error_occurred = False # 에러 발생 여부 플래그
-    
-    # Initialize database
+    # Initialize GCS writer
     try:
-        db = Database()
-        db.create_table()
-        logger.info("Database initialized successfully")
+        gcs_writer = GCSParquetWriter(bucket_name, credentials_path,gcs_prefix)
+        logger.info("GCS writer initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-        logger.error("Please check your .env file and database connection")
+        logger.error(f"Failed to initialize GCS writer: {e}")
         sys.exit(1)
 
-    # Process each stock
-    total_crawled = 0
-    total_saved = 0
+    # Delete existing files for the date range (refresh)
+    print("=" * 80)
+    print("🗑️  Cleaning up existing files for date range...")
+    print("=" * 80)
+    try:
+        deleted_count = gcs_writer.delete_files_by_date_range(start_date, end_date, source='naver')
+        if deleted_count > 0:
+            print(f"✅ Deleted {deleted_count} existing files")
+        else:
+            print("✅ No existing files to delete")
+        print()
+    except Exception as e:
+        logger.warning(f"Failed to delete existing files (continuing anyway): {e}")
+        print(f"⚠️  Warning: Could not delete existing files: {e}")
+        print()
+
+    # Start processing
     start_time = time.time()
 
-    print('=' * 80)
-    print('Starting crawl process...')
-    print('=' * 80)
-    print()
-
     try:
-        # Use ProcessPoolExecutor for parallel stock processing
-        with ProcessPoolExecutor(max_workers=stock_processes) as executor:
-            # Submit all stocks for processing
-            future_to_stock = {
-                executor.submit(process_single_stock, stock_code, max_posts, max_workers): stock_code
-                for stock_code in stock_codes
-            }
+        # Phase 1: Collect metadata
+        batch_map = await collect_metadata(stock_codes, start_date, end_date)
 
-            # Process results as they complete
-            completed = 0
-            for future in as_completed(future_to_stock):
-                stock_code = future_to_stock[future]
-                completed += 1
+        if not batch_map:
+            logger.warning("No posts found in date range")
+            sys.exit(0)
 
-                try:
-                    stock_code, discussions, stock_elapsed = future.result()
-
-                    print(f'\n[{completed}/{len(stock_codes)}] Processing stock: {stock_code}')
-                    print('-' * 80)
-
-                    logger.info("-" * 60)
-                    logger.info(f"Processing stock {completed}/{len(stock_codes)}: {stock_code}")
-                    logger.info("-" * 60)
-
-                    if discussions:
-                        # Save to database (using efficient execute_batch)
-                        saved_count = db.insert_batch(discussions)
-
-                        total_crawled += len(discussions)
-                        total_saved += saved_count
-
-                        logger.info(f"Stock {stock_code}: Crawled {len(discussions)}, Saved {saved_count} in {stock_elapsed:.2f}s")
-
-                        print(f'  ✅ Crawled: {len(discussions)} posts')
-                        print(f'  ✅ Saved: {saved_count} posts')
-                        print(f'  ⏱️  Time: {stock_elapsed:.2f}s')
-                    else:
-                        logger.warning(f"No discussions found for stock {stock_code}")
-                        print(f'  ⚠️  No posts found')
-
-                except Exception as e:
-                    error_occurred = True # 에러 플래그 설정
-                    logger.error(f"Error processing result for stock {stock_code}: {e}")
-                    print(f'  ❌ Error: {e}')
-
-    except KeyboardInterrupt:
-        error_occurred = True # 중단도 에러로 간주 (커밋 방지)
-        logger.info("\nCrawling interrupted by user")
-        print('\n\nProcess interrupted by user. Cleaning up...')
-        
-
-    except Exception as e:
-        error_occurred = True # 에러 플래그 설정
-        logger.error(f"Unexpected error during crawling: {e}")
-        print(f'  ❌ Error: {e}')
-
-    finally:
-        total_elapsed = time.time() - start_time
-        
-        if db:
-            if error_occurred:
-                logger.warning("Errors occurred. Rolling back changes...")
-                db.rollback() # ⭐️ 1. 에러가 났으면 롤백
-            else:
-                logger.info("Crawl complete. Committing all changes...")
-                db.commit() # ⭐️ 2. 에러가 없으면 최종 커밋
-            
-            # ⭐️ 3. 커밋/롤백 후 연결 종료
-            db.close()
+        # Phase 2: Crawl and save
+        stats = await crawl_and_save(batch_map, gcs_writer, stock_name_map, max_concurrent=50)
 
         # Summary
+        total_elapsed = time.time() - start_time
+
         print()
         print('=' * 80)
-        print('Crawl completed!' if not error_occurred else 'Crawl finished with errors!')
+        print('✅ Crawl completed successfully!')
         print('=' * 80)
-        print(f'Total stocks processed: {completed}/{len(stock_codes)}')
-        print(f'Total posts crawled: {total_crawled}')
-        print(f'Total posts saved (uncommitted if errors): {total_saved}')
+        print(f'Total posts crawled: {stats["total_posts"]}')
+        print(f'Total files saved: {len(stats["saved_files"])}')
+        print(f'Errors: {stats["errors"]}')
         print(f'Total time: {total_elapsed:.2f}s ({total_elapsed/60:.1f} minutes)')
-        if total_crawled > 0:
-            print(f'Average speed: {total_elapsed/total_crawled:.2f}s per post')
+        if stats['total_posts'] > 0:
+            print(f'Average speed: {total_elapsed/stats["total_posts"]:.3f}s per post')
         print(f'Finished at: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
         print('=' * 80)
+        print()
+        print('📂 Saved files:')
+        for file_path in stats['saved_files'][:10]:  # Show first 10
+            print(f'  - {file_path}')
+        if len(stats['saved_files']) > 10:
+            print(f'  ... and {len(stats["saved_files"]) - 10} more files')
+        print('=' * 80)
 
-        logger.info("=" * 60)
-        logger.info("Naver Crawling Summary")
-        logger.info("=" * 60)
-        logger.info(f"Total Stocks Processed: {completed}/{len(stock_codes)}")
-        logger.info(f"Total Discussions Crawled: {total_crawled}")
-        logger.info(f"Total Discussions Saved: {total_saved}")
-        if error_occurred:
-            logger.warning("Changes were ROLLED BACK due to errors.")
-        else:
-            logger.info("Changes were COMMITTED successfully.")
-        logger.info(f"Total Time: {total_elapsed:.2f}s")
-        logger.info("=" * 60)
-        logger.info("Naver Crawler finished")
+    except KeyboardInterrupt:
+        logger.info("\nCrawling interrupted by user")
+        print('\n\nProcess interrupted by user.')
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

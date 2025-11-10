@@ -40,6 +40,12 @@ pip install -r $REQUIREMENTS_FILE
 
 echo "----------------------------------------"
 echo "✅ Setup complete. Environment is ready."
-echo "You can now run the bot using ./start_naver.sh"
+echo ""
+echo "Next steps:"
+echo "  1. Configure .env file with GCS bucket and credentials"
+echo "  2. Run crawler: ./start_naver.sh"
+echo ""
+echo "For testing: Set STOCK_CSV_FILE=Market Data_top10.csv in .env"
+echo "For production: Set STOCK_CSV_FILE=Market Data.csv in .env"
 echo "----------------------------------------"
 

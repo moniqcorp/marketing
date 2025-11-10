@@ -30,10 +30,30 @@ TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
 LOG_FILE="${LOG_DIR}/${LOG_PREFIX}_${TIMESTAMP}.log"
 
 # 6. 스크립트 실행
-echo "Running Python script: $PYTHON_SCRIPT"
-echo "Log file will be saved to: $LOG_FILE"
+echo "=========================================="
+echo "Naver Stock Discussion Crawler"
+echo "=========================================="
+echo "Python script: $PYTHON_SCRIPT"
+echo "Log file: $LOG_FILE"
+echo ""
+echo "Date range options:"
+echo "  1. Default: Last 3 days (today - 2 days to today)"
+echo "  2. Custom: ./start_naver.sh 2025-01-01 2025-01-07"
+echo "=========================================="
+echo ""
 
-# 가상환경의 python 사용 (python3가 아닌 python 또는 직접 경로)
-python $PYTHON_SCRIPT > $LOG_FILE 2>&1
+# 가상환경의 python 사용
+# 명령줄 인자가 있으면 전달, 없으면 기본값(최근 3일) 사용
+if [ $# -ge 2 ]; then
+    echo "Using custom date range: $1 ~ $2"
+    python $PYTHON_SCRIPT "$1" "$2" 2>&1 | tee $LOG_FILE
+else
+    echo "Using default date range (last 3 days)"
+    python $PYTHON_SCRIPT 2>&1 | tee $LOG_FILE
+fi
 
+echo ""
+echo "=========================================="
 echo "Script execution finished."
+echo "Log saved to: $LOG_FILE"
+echo "=========================================="
