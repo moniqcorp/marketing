@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stock-crawler-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount credentials for GCS access
+      - ./credentials:/app/credentials:ro
+      # Mount logs for persistence
+      - ./log:/app/log
+      # Mount temporary data directories
+      - ./toss_comments:/app/toss_comments
+      - ./naver_discussions:/app/naver_discussions
+    environment:
+      # GCS Configuration
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - GCS_CREDENTIALS_PATH=/app/credentials/moniq-gcp-key.json
+      # Crawler Configuration
+      - MAX_THREADS=${MAX_THREADS:-5}
+      - MAX_RETRIES=${MAX_RETRIES:-3}
+      - REQUEST_DELAY=${REQUEST_DELAY:-0.1}
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - stock-network
+
+networks:
+  stock-network:
+    driver: bridge
