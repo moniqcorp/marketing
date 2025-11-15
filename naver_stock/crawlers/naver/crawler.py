@@ -2,7 +2,7 @@
 Naver Stock Discussion Crawler for PC Version
 - Uses requests + BeautifulSoup (no Selenium/Playwright needed)
 - Hybrid approach: PC HTML for list + Mobile JSON for detail
-- Much faster and lighter than v1
+- Inherits from BaseCrawler for common functionality
 """
 
 import os
@@ -18,19 +18,28 @@ from bs4 import BeautifulSoup
 import requests
 from dotenv import load_dotenv
 
+from core.crawler.base import BaseCrawler
+
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
-class NaverStockCrawlerPC:
+class NaverStockCrawler(BaseCrawler):
     """Crawler for Naver Stock discussions (PC version)"""
 
-    def __init__(self):
+    def __init__(self, request_delay=None, max_retries=None):
+        """
+        Initialize Naver Stock Crawler
+
+        Args:
+            request_delay: Delay between requests (default from env or 0.3)
+            max_retries: Max retries (default from env or 3)
+        """
+        request_delay = request_delay or float(os.getenv('REQUEST_DELAY', '0.3'))
+        max_retries = max_retries or int(os.getenv('MAX_RETRIES', '3'))
+        super().__init__(request_delay, max_retries)
+
         self.base_url = "https://finance.naver.com"
         self.mobile_url = "https://m.stock.naver.com"
         self.session = requests.Session()
@@ -39,8 +48,6 @@ class NaverStockCrawlerPC:
         })
         # Disable cleanbot to see all posts
         self.session.cookies.set('hide_cleanbot_contents', 'off', domain='.naver.com')
-        self.request_delay = float(os.getenv('REQUEST_DELAY', '0.3'))
-        self.max_retries = int(os.getenv('MAX_RETRIES', '3'))
 
     def reset_session(self):
         """Reset session to clear any connection issues"""
@@ -49,7 +56,6 @@ class NaverStockCrawlerPC:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
-        # Disable cleanbot to see all posts
         self.session.cookies.set('hide_cleanbot_contents', 'off', domain='.naver.com')
         logger.info("Session reset")
 
@@ -344,7 +350,7 @@ class NaverStockCrawlerPC:
 
         # If max_pages is None, continue until we hit start_date or run out of pages
         while True:
-            # Safety limit: stop at 1000 pages (extremely unlikely to reach this)
+            # Safety limit: stop at 1000 pages
             if page > 1000:
                 logger.warning(f"Reached safety limit of 1000 pages for stock {stock_code}")
                 break
@@ -366,7 +372,6 @@ class NaverStockCrawlerPC:
                     logger.info(f"Stopping at page {page}: posts older than start_date ({start_date.strftime('%Y-%m-%d')})")
                     break
             else:
-                # Old behavior compatibility
                 all_nid_date_pairs.extend(result)
 
             # Check max_pages limit if specified
@@ -379,7 +384,7 @@ class NaverStockCrawlerPC:
         logger.info(f"[ASYNC] Collected {len(all_nid_date_pairs)} NIDs with dates for stock {stock_code} ({page} pages)")
         return all_nid_date_pairs
 
-    def get_discussion_detail(self, stock_code, nid, stock_name=None, retry_count=0):
+    def get_discussion_detail(self, stock_code, nid, stock_name=None, isin_code=None, retry_count=0):
         """
         Get discussion detail from mobile iframe + PC page for comments
 
@@ -387,16 +392,16 @@ class NaverStockCrawlerPC:
             stock_code: Stock code
             nid: Discussion ID
             stock_name: Stock name (optional)
+            isin_code: ISIN code (optional)
             retry_count: Current retry attempt (internal use)
 
         Returns:
             dict: Discussion data
         """
         mobile_url = f"{self.mobile_url}/pc/domestic/stock/{stock_code}/discussion/{nid}"
-        pc_url = f"{self.base_url}/item/board_read.naver?code={stock_code}&nid={nid}"
 
         try:
-            # Step 1: Get mobile iframe for content
+            # Get mobile iframe for content
             logger.debug(f"Fetching detail from: {mobile_url}")
 
             response = self.session.get(mobile_url)
@@ -434,27 +439,21 @@ class NaverStockCrawlerPC:
             content_text = ''
 
             if content_html:
-                # Normal post with HTML content
                 content_soup = BeautifulSoup(content_html, 'html.parser')
                 content_text = content_soup.get_text(separator='\n', strip=True)
             else:
                 # AI summary post or other special format
-                # Try contentJsonSwReplaced
                 content_json = discussion_data.get('contentJsonSwReplaced', '')
                 if content_json:
                     try:
-                        import json as json_module
-                        content_data = json_module.loads(content_json)
-                        # Extract summary HTML
+                        content_data = json.loads(content_json)
                         summary_html = content_data.get('contentSummary', '')
                         if summary_html:
                             summary_soup = BeautifulSoup(summary_html, 'html.parser')
                             content_text = summary_soup.get_text(separator='\n', strip=True)
                     except:
-                        # If JSON parsing fails, just use the raw string
                         content_text = content_json
 
-            # Combine title and content
             full_content = f"{title}\n\n{content_text}" if title else content_text
 
             likes_count = discussion_data.get('recommendCount', 0)
@@ -464,7 +463,7 @@ class NaverStockCrawlerPC:
             written_at = discussion_data.get('writtenAt', '')
             date = self.parse_date(written_at)
 
-            # Step 2: Get comments using Naver comment API
+            # Get comments using Naver comment API
             comments = []
             try:
                 comments = self.get_comments_via_api(nid, stock_code)
@@ -477,13 +476,15 @@ class NaverStockCrawlerPC:
             return {
                 'stock_code': stock_code,
                 'stock_name': stock_name,
+                'isin_code': isin_code or '',
                 'comment_id': int(nid),
                 'author_name': author_name,
                 'date': date,
                 'content': full_content,
                 'likes_count': likes_count,
                 'dislikes_count': dislikes_count,
-                'comment_data': comments
+                'comment_data': comments,
+                'source': 'naver'
             }
 
         except Exception as e:
@@ -492,12 +493,10 @@ class NaverStockCrawlerPC:
                 logger.info(f"Inaccessible URL: {mobile_url}")
                 logger.info(f"Retrying nid={nid} after session reset...")
 
-                # Reset session before retry
                 self.reset_session()
-                time.sleep(1)  # Wait before retry
+                time.sleep(1)
 
-                # Retry with incremented count
-                return self.get_discussion_detail(stock_code, nid, stock_name, retry_count + 1)
+                return self.get_discussion_detail(stock_code, nid, stock_name, isin_code, retry_count + 1)
             else:
                 logger.error(f"Failed to crawl nid={nid} after {self.max_retries} retries: {e}")
                 logger.info(f"Permanently inaccessible URL: {mobile_url}")
@@ -505,7 +504,7 @@ class NaverStockCrawlerPC:
 
     def get_comments_via_api(self, nid, stock_code, page=1, page_size=100):
         """
-        Get comments using Naver comment API (no Selenium needed!)
+        Get comments using Naver comment API
 
         Args:
             nid: Discussion ID
@@ -540,7 +539,6 @@ class NaverStockCrawlerPC:
             '_': str(int(time.time() * 1000))
         }
 
-        # Add mobile User-Agent and Referer for comment API
         headers = {
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 13_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.4 Mobile/15E148 Safari/604.1',
             'Referer': f'https://m.stock.naver.com/domestic/stock/{stock_code}/discussion/{nid}'
@@ -561,7 +559,6 @@ class NaverStockCrawlerPC:
                 comments = []
 
                 for idx, comment in enumerate(comment_list, 1):
-                    # Parse comment date
                     reg_time = comment.get('regTime', '')
                     comment_date = self.parse_date(reg_time)
 
@@ -581,38 +578,6 @@ class NaverStockCrawlerPC:
         else:
             logger.warning(f"Comment API returned status {response.status_code} for nid={nid}")
             return []
-
-    def parse_date(self, date_str):
-        """
-        Parse date string to DB format
-
-        Args:
-            date_str: ISO 8601 format (e.g., "2025-11-01T13:36:00+09:00" or "2025-11-01T13:36:00.000Z")
-
-        Returns:
-            str: "YYYY-MM-DD HH:MM:SS" format
-        """
-        if not date_str:
-            return None
-
-        try:
-            # Remove timezone info (everything after + or Z)
-            if '+' in date_str:
-                date_str = date_str.split('+')[0]
-            elif date_str.endswith('Z'):
-                date_str = date_str[:-1]
-
-            # Remove milliseconds if present
-            if '.' in date_str:
-                date_str = date_str.split('.')[0]
-
-            # Parse ISO format
-            dt = datetime.fromisoformat(date_str)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-        except Exception as e:
-            logger.warning(f"Date parsing error: {e} for date_str={date_str}")
-            return None
 
     def parse_list_date(self, date_text):
         """
@@ -634,7 +599,6 @@ class NaverStockCrawlerPC:
         try:
             # Format: "2025.11.01 14:32" or "2025.11.01" or "11.01"
             if '.' in date_text:
-                # Remove time part if exists (e.g., "2025.11.10 14:32" -> "2025.11.10")
                 date_part = date_text.split()[0] if ' ' in date_text else date_text
                 parts = date_part.split('.')
 
@@ -661,69 +625,9 @@ class NaverStockCrawlerPC:
             logger.warning(f"Error parsing list date '{date_text}': {e}")
             return None
 
-    def crawl_stock_discussions(self, stock_code, max_posts=50, max_workers=10):
-        """
-        Main method: Get list then fetch details in parallel
-
-        Args:
-            stock_code: Stock code
-            max_posts: Maximum number of posts to crawl
-            max_workers: Number of parallel workers
-
-        Returns:
-            list: List of discussion dictionaries
-        """
-        logger.info(f"Starting to crawl stock {stock_code}")
-
-        # Step 1: Get discussion list
-        nid_list, stock_name = self.get_discussion_list(stock_code, max_pages=10)
-
-        if not nid_list:
-            logger.warning(f"No discussions found for stock {stock_code}")
-            return []
-
-        # Limit to max_posts
-        nid_list = nid_list[:max_posts]
-
-        # Step 2: Fetch details in parallel
-        logger.info(f"Fetching {len(nid_list)} discussion details with {max_workers} workers...")
-        results = []
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_nid = {
-                executor.submit(self.get_discussion_detail, stock_code, nid, stock_name): nid
-                for nid in nid_list
-            }
-
-            # Collect results as they complete
-            completed = 0
-            for future in as_completed(future_to_nid):
-                nid = future_to_nid[future]
-                completed += 1
-
-                try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                        logger.info(f"Progress: {completed}/{len(nid_list)} completed")
-                except Exception as e:
-                    logger.error(f"Error processing nid={nid}: {e}")
-
-                # Add delay between requests
-                time.sleep(self.request_delay)
-
-        logger.info(f"Completed crawling {len(results)} discussions for stock {stock_code}")
-        return results
-
-    # ============================================================================
-    # ASYNC VERSION - High Performance
-    # ============================================================================
-
     async def get_discussion_detail_async(self, session, stock_code, nid, stock_name=None, isin_code=None):
         """
         Async version of get_discussion_detail
-        Fetch discussion detail using aiohttp
         """
         url = f"{self.mobile_url}/pc/domestic/stock/{stock_code}/discussion/{nid}"
 
@@ -784,7 +688,6 @@ class NaverStockCrawlerPC:
 
                     full_content = f"{title}\n\n{content_text}"
 
-                    # Parse date (API uses 'writtenAt' field, not 'regDate')
                     written_at = discussion_data.get('writtenAt', '')
                     post_date = self.parse_date(written_at)
 
@@ -794,7 +697,6 @@ class NaverStockCrawlerPC:
                     # Get comments via API (async)
                     comments = await self.get_comments_via_api_async(session, nid, stock_code)
 
-                    # Log successful retry if this wasn't the first attempt
                     if attempt > 0:
                         logger.info(f"✅ Retry successful for nid={nid} after {attempt + 1} attempts")
 
@@ -893,10 +795,61 @@ class NaverStockCrawlerPC:
 
         return []
 
+    def crawl_stock_discussions(self, stock_code, max_posts=50, max_workers=10):
+        """
+        Main method: Get list then fetch details in parallel
+
+        Args:
+            stock_code: Stock code
+            max_posts: Maximum number of posts to crawl
+            max_workers: Number of parallel workers
+
+        Returns:
+            list: List of discussion dictionaries
+        """
+        logger.info(f"Starting to crawl stock {stock_code}")
+
+        # Get discussion list
+        nid_list, stock_name = self.get_discussion_list(stock_code, max_pages=10)
+
+        if not nid_list:
+            logger.warning(f"No discussions found for stock {stock_code}")
+            return []
+
+        # Limit to max_posts
+        nid_list = nid_list[:max_posts]
+
+        # Fetch details in parallel
+        logger.info(f"Fetching {len(nid_list)} discussion details with {max_workers} workers...")
+        results = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_nid = {
+                executor.submit(self.get_discussion_detail, stock_code, nid, stock_name): nid
+                for nid in nid_list
+            }
+
+            completed = 0
+            for future in as_completed(future_to_nid):
+                nid = future_to_nid[future]
+                completed += 1
+
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                        logger.info(f"Progress: {completed}/{len(nid_list)} completed")
+                except Exception as e:
+                    logger.error(f"Error processing nid={nid}: {e}")
+
+                time.sleep(self.request_delay)
+
+        logger.info(f"Completed crawling {len(results)} discussions for stock {stock_code}")
+        return results
+
     async def crawl_stock_discussions_async(self, stock_code, max_posts=50, max_concurrent=50):
         """
         Async version of crawl_stock_discussions
-        Much faster than ThreadPool version
 
         Args:
             stock_code: Stock code
@@ -908,14 +861,13 @@ class NaverStockCrawlerPC:
         """
         logger.info(f"[ASYNC] Starting to crawl stock {stock_code}")
 
-        # Create aiohttp session with optimized connection pooling
         connector = aiohttp.TCPConnector(
-            limit=150,                      # Total connection limit (increased from 50)
-            limit_per_host=100,             # Per-host limit (increased from 50)
-            ttl_dns_cache=300,              # DNS cache for 5 minutes
-            enable_cleanup_closed=True,     # Auto-cleanup closed connections
-            force_close=False,              # Enable keep-alive
-            keepalive_timeout=60            # Keep-alive timeout 60s
+            limit=150,
+            limit_per_host=100,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            force_close=False,
+            keepalive_timeout=60
         )
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=30)
 
@@ -925,17 +877,15 @@ class NaverStockCrawlerPC:
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
             cookies={'hide_cleanbot_contents': 'off'}
         ) as session:
-            # Step 1: Get discussion list (ASYNC - 10 pages concurrently)
+            # Get discussion list
             nid_list, stock_name = await self.get_discussion_list_async(session, stock_code, max_pages=10)
 
             if not nid_list:
                 logger.warning(f"No discussions found for stock {stock_code}")
                 return []
 
-            # Limit to max_posts
             nid_list = nid_list[:max_posts]
 
-            # Step 2: Fetch details in parallel with async
             logger.info(f"[ASYNC] Fetching {len(nid_list)} discussions with max {max_concurrent} concurrent requests...")
 
             results = []
@@ -946,8 +896,6 @@ class NaverStockCrawlerPC:
                     return await self.get_discussion_detail_async(session, stock_code, nid, stock_name)
 
             tasks = [fetch_with_semaphore(nid) for nid in nid_list]
-
-            # Gather all results
             completed_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for idx, result in enumerate(completed_results):
@@ -963,7 +911,7 @@ class NaverStockCrawlerPC:
 
 if __name__ == "__main__":
     # Test crawler
-    crawler = NaverStockCrawlerPC()
+    crawler = NaverStockCrawler()
     results = crawler.crawl_stock_discussions('005930', max_posts=10)
 
     logger.info(f"\nCrawled {len(results)} discussions")
@@ -971,6 +919,6 @@ if __name__ == "__main__":
         logger.info(f"Sample: {results[0]}")
 
         # Save to JSON for inspection
-        with open('v2_sample.json', 'w', encoding='utf-8') as f:
+        with open('naver_sample.json', 'w', encoding='utf-8') as f:
             json.dump({"results": results}, f, ensure_ascii=False, indent=2)
-        logger.info("Sample saved to v2_sample.json")
+        logger.info("Sample saved to naver_sample.json")

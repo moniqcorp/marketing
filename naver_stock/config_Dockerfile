@@ -1,0 +1,27 @@
+# Python 3.12.12 (ARM64 자동 지원, Raspberry Pi 5 호환)
+FROM python:3.12.12-slim
+
+# 필수 빌드 도구 설치
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc curl build-essential libpq-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# 컨테이너 내부 작업 디렉토리 설정
+WORKDIR /app
+
+# 호스트의 키 파일을 이 경로로 주입합니다.
+ENV GCS_CREDENTIALS_PATH="/app/gcs-credentials.json"
+ENV GCS_BUCKET_NAME="moniq-bucket"
+
+
+# requirements.txt 복사 및 설치
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN playwright install --with-deps
+
+# 코드 복사 (main.py + app 전체 폴더)
+COPY main.py .
+COPY app ./app
+
+# FastAPI 서버 실행 명령
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

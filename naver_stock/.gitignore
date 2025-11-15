@@ -63,6 +63,7 @@ schema.sql
 archived_files/
 history/
 docs/
+legacy/
 
 # Data files
 Moniq Company Info.csv

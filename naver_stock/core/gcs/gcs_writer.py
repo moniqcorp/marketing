@@ -8,8 +8,8 @@ import logging
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from google.cloud import storage
-from datetime import datetime
+from google.cloud import storage as gcs_storage
+from datetime import datetime, timedelta
 from io import BytesIO
 
 logger = logging.getLogger(__name__)
@@ -32,10 +32,10 @@ class GCSParquetWriter:
 
         # Initialize GCS client
         if credentials_path and os.path.exists(credentials_path):
-            self.client = storage.Client.from_service_account_json(credentials_path)
+            self.client = gcs_storage.Client.from_service_account_json(credentials_path)
             logger.info(f"GCS client initialized with credentials: {credentials_path}")
         else:
-            self.client = storage.Client()
+            self.client = gcs_storage.Client()
             logger.info("GCS client initialized with default credentials")
 
         self.bucket = self.client.bucket(bucket_name)
@@ -51,7 +51,7 @@ class GCSParquetWriter:
             self.batch_counters[date_key] += 1
         return self.batch_counters[date_key]
 
-    def save_batch(self, date_key, data, source='naver', stock_code=None):
+    def save_batch(self, date_key, data, source='naver', stock_code=None, schema=None):
         """
         Save a batch of data to GCS with Hive-style partitioning
 
@@ -60,6 +60,7 @@ class GCSParquetWriter:
             data: List of dictionaries (discussion data)
             source: Data source name ('naver' or 'toss')
             stock_code: Stock code for filename (optional, extracted from data if None)
+            schema: PyArrow schema (optional, auto-detected if None)
 
         Returns:
             str: GCS file path
@@ -84,21 +85,9 @@ class GCSParquetWriter:
 
             df['dt'] = dt_value
 
-            # Define explicit PyArrow schema for BigQuery compatibility
-            schema = pa.schema([
-                ('stock_code', pa.string()),
-                ('stock_name', pa.string()),
-                ('isin_code', pa.string()),  # ISIN code
-                ('comment_id', pa.int64()),
-                ('author_name', pa.string()),
-                ('date', pa.string()),  # Store as string for BigQuery compatibility
-                ('content', pa.string()),
-                ('likes_count', pa.int64()),
-                ('dislikes_count', pa.int64()),
-                ('comment_data', pa.string()),  # JSON stored as string
-                ('source', pa.string()),  # Data source (e.g., 'naver', 'toss')
-                ('dt', pa.string())  # Partition column
-            ])
+            # Use provided schema or create default one
+            if schema is None:
+                schema = self._create_default_schema()
 
             # Convert DataFrame to PyArrow Table with explicit schema
             table = pa.Table.from_pandas(df, schema=schema)
@@ -134,7 +123,24 @@ class GCSParquetWriter:
             logger.error(f"Failed to save batch to GCS: {e}")
             raise
 
-    def save_batch_stream(self, date_key, data, source='naver', max_rows_per_file=1000):
+    def _create_default_schema(self):
+        """Create default PyArrow schema for stock discussion data"""
+        return pa.schema([
+            ('stock_code', pa.string()),
+            ('stock_name', pa.string()),
+            ('isin_code', pa.string()),
+            ('comment_id', pa.int64()),
+            ('author_name', pa.string()),
+            ('date', pa.string()),
+            ('content', pa.string()),
+            ('likes_count', pa.int64()),
+            ('dislikes_count', pa.int64()),
+            ('comment_data', pa.string()),
+            ('source', pa.string()),
+            ('dt', pa.string())
+        ])
+
+    def save_batch_stream(self, date_key, data, source='naver', max_rows_per_file=1000, schema=None):
         """
         Save data in streaming fashion (splits into multiple files if needed)
 
@@ -143,6 +149,7 @@ class GCSParquetWriter:
             data: List of dictionaries
             source: Data source name
             max_rows_per_file: Maximum rows per file
+            schema: PyArrow schema (optional)
 
         Returns:
             list: List of GCS file paths
@@ -155,7 +162,7 @@ class GCSParquetWriter:
         # Split data into chunks
         for i in range(0, len(data), max_rows_per_file):
             chunk = data[i:i + max_rows_per_file]
-            file_path = self.save_batch(date_key, chunk, source)
+            file_path = self.save_batch(date_key, chunk, source, schema=schema)
             if file_path:
                 saved_files.append(file_path)
 
@@ -194,8 +201,6 @@ class GCSParquetWriter:
         Returns:
             int: Number of files deleted
         """
-        from datetime import timedelta
-
         deleted_count = 0
         current_date = start_date
 
@@ -232,8 +237,6 @@ class GCSParquetWriter:
         Returns:
             int: Number of files deleted
         """
-        from datetime import timedelta
-
         deleted_count = 0
         current_date = start_date
 
@@ -262,177 +265,3 @@ class GCSParquetWriter:
             logger.info(f"✅ Total deleted: {deleted_count} files")
 
         return deleted_count
-
-
-class DatePartitionedBuffer:
-    """
-    Buffer that accumulates data by date and stock_code, auto-flushes to GCS
-    """
-
-    def __init__(self, gcs_writer, buffer_size=1000, source='naver'):
-        """
-        Initialize buffer
-
-        Args:
-            gcs_writer: GCSParquetWriter instance
-            buffer_size: Number of rows before auto-flush (per stock)
-            source: Data source name
-        """
-        self.gcs_writer = gcs_writer
-        self.buffer_size = buffer_size
-        self.source = source
-
-        # Date and stock-based buffers: {(date_key, stock_code): [data]}
-        self.buffers = {}
-
-        # Track which stock+date combinations have been deleted: {(stock_code, date_key)}
-        self.deleted_stocks = set()
-
-        # Track all saved files (including auto-flushed files)
-        self.all_saved_files = []
-
-    def add(self, post_date, data):
-        """
-        Add data to buffer
-
-        Args:
-            post_date: datetime object or YYYYMMDD string
-            data: Dictionary of post data (must contain 'stock_code')
-        """
-        # Convert datetime to date_key
-        if isinstance(post_date, datetime):
-            date_key = post_date.strftime('%Y%m%d')
-        else:
-            date_key = post_date
-
-        # Get stock_code from data
-        stock_code = data.get('stock_code')
-        if not stock_code:
-            logger.warning("Data missing stock_code, skipping")
-            return
-
-        # Create buffer key
-        buffer_key = (date_key, stock_code)
-
-        # Initialize buffer if needed
-        if buffer_key not in self.buffers:
-            self.buffers[buffer_key] = []
-
-        # Add data
-        self.buffers[buffer_key].append(data)
-
-        # Auto-flush if buffer is full
-        if len(self.buffers[buffer_key]) >= self.buffer_size:
-            saved = self.flush(date_key, stock_code)
-            self.all_saved_files.extend(saved)
-
-    def flush(self, date_key=None, stock_code=None):
-        """
-        Flush buffer to GCS (deletes existing files for stock+date before saving)
-
-        Args:
-            date_key: Specific date to flush (None = flush all)
-            stock_code: Specific stock to flush (None = flush all for date)
-
-        Returns:
-            list: List of saved file paths (only from this flush, not cumulative)
-        """
-        saved_files = []
-
-        if date_key and stock_code:
-            # Flush specific date + stock
-            buffer_key = (date_key, stock_code)
-            if buffer_key in self.buffers and self.buffers[buffer_key]:
-                # Delete existing files for this stock+date combination only
-                delete_key = (stock_code, date_key)
-                if delete_key not in self.deleted_stocks:
-                    self._delete_files_for_stock_date(stock_code, date_key)
-                    self.deleted_stocks.add(delete_key)
-
-                # Save new data
-                file_path = self.gcs_writer.save_batch(
-                    date_key, self.buffers[buffer_key], self.source, stock_code
-                )
-                if file_path:
-                    saved_files.append(file_path)
-                    self.all_saved_files.append(file_path)  # Track all files
-                self.buffers[buffer_key].clear()
-        elif date_key:
-            # Flush all stocks for specific date
-            keys_to_flush = [k for k in self.buffers.keys() if k[0] == date_key]
-            for buffer_key in keys_to_flush:
-                if self.buffers[buffer_key]:
-                    dk, sc = buffer_key
-
-                    # Delete existing files for this stock+date combination only
-                    delete_key = (sc, dk)
-                    if delete_key not in self.deleted_stocks:
-                        self._delete_files_for_stock_date(sc, dk)
-                        self.deleted_stocks.add(delete_key)
-
-                    # Save new data
-                    file_path = self.gcs_writer.save_batch(dk, self.buffers[buffer_key], self.source, sc)
-                    if file_path:
-                        saved_files.append(file_path)
-                        self.all_saved_files.append(file_path)  # Track all files
-                    self.buffers[buffer_key].clear()
-        else:
-            # Flush all dates and stocks
-            for buffer_key in list(self.buffers.keys()):
-                if self.buffers[buffer_key]:
-                    dk, sc = buffer_key
-
-                    # Delete existing files for this stock+date combination only
-                    delete_key = (sc, dk)
-                    if delete_key not in self.deleted_stocks:
-                        self._delete_files_for_stock_date(sc, dk)
-                        self.deleted_stocks.add(delete_key)
-
-                    # Save new data
-                    file_path = self.gcs_writer.save_batch(dk, self.buffers[buffer_key], self.source, sc)
-                    if file_path:
-                        saved_files.append(file_path)
-                        self.all_saved_files.append(file_path)  # Track all files
-                    self.buffers[buffer_key].clear()
-
-        return saved_files
-
-    def _delete_files_for_stock_date(self, stock_code, date_key):
-        """Delete files for specific stock and date only"""
-        from datetime import datetime
-
-        # Convert date_key (YYYYMMDD) to datetime
-        if len(date_key) == 8:
-            date_str = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
-        else:
-            date_str = date_key
-
-        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-
-        # Delete files for this specific date only
-        prefix = self.gcs_writer.gcs_prefix + '/' if self.gcs_writer.gcs_prefix else ''
-        prefix += f"dt={date_str}/{stock_code}_{self.source}_"
-
-        blobs = list(self.gcs_writer.bucket.list_blobs(prefix=prefix))
-
-        if blobs:
-            for blob in blobs:
-                blob.delete()
-            logger.info(f"🗑️  Deleted {len(blobs)} existing files for {stock_code} on {date_str}")
-
-    def get_buffer_stats(self):
-        """Get current buffer statistics"""
-        return {
-            f"{date_key}_{stock_code}": len(data)
-            for (date_key, stock_code), data in self.buffers.items()
-            if data
-        }
-
-    def get_all_saved_files(self):
-        """
-        Get all saved files including auto-flushed files
-
-        Returns:
-            list: All file paths saved during this session
-        """
-        return self.all_saved_files.copy()
