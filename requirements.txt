@@ -1,0 +1,45 @@
+# FastAPI and server
+fastapi==0.120.4
+uvicorn==0.38.0
+pydantic==2.12.3
+pydantic-settings==2.11.0
+starlette==0.49.3
+
+# Web scraping and automation (Naver 크롤러용)
+requests==2.32.5
+beautifulsoup4==4.12.3
+lxml==5.1.0
+
+# Playwright (Toss 크롤러용)
+playwright==1.55.0
+playwright-stealth==2.0.0
+
+# HTTP clients
+curl-cffi==0.13.0
+httpx==0.28.1
+httptools==0.7.1
+
+# Async support
+aiohttp==3.13.2
+aiolimiter==1.2.1
+anyio==4.11.0
+
+# Data processing
+pandas==2.3.3
+numpy==2.3.4
+pyarrow==22.0.0
+
+# Cloud storage
+google-cloud-storage==3.5.0
+google-cloud-bigquery==3.38.0
+google-cloud-core==2.5.0
+
+# Environment management
+python-dotenv==1.2.1
+pydantic-extra-types==2.10.6
+
+# Additional dependencies
+certifi==2025.10.5
+charset-normalizer==3.4.4
+idna==3.11
+urllib3==2.5.0
